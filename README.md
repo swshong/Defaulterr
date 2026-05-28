@@ -102,6 +102,8 @@ Filters define how audio and subtitle streams are updated based on specified cri
 
 Multiple groups and filters can be defined per library, with the first matching filter being applied. If no filters match, the item remains unchanged in Plex. Filters can utilize any property in the stream object returned by Plex. See [example.json](https://github.com/varthe/Defaulterr/blob/main/example.json) for examples.
 
+Subtitle filter arrays may end with `- disabled` to explicitly turn subtitles off when no earlier subtitle filter matches. This is useful for avoiding stale Plex/user subtitle selections, such as a random non-preferred subtitle track remaining selected when the preferred language is missing.
+
 ```yaml
 filters:
   Movies: # Library name
@@ -156,6 +158,8 @@ filters:
                     language: English
                   exclude:
                     extendedDisplayTitle: signs
+                # If no English subtitles match, explicitly turn subtitles off
+                - disabled
 ```
 
 ### Tautulli Webhook Integration

@@ -85,3 +85,5 @@ filters:
                   language: English
                 exclude:
                   extendedDisplayTitle: signs
+              # If no English subtitles match, explicitly turn subtitles off
+              - disabled

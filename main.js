@@ -11,6 +11,10 @@ const config = loadAndValidateYAML()
 const app = express()
 app.use(express.json())
 
+app.get("/health", (_req, res) => {
+    res.status(200).json({ status: "ok" })
+})
+
 const STREAM_TYPES = { video: 1, audio: 2, subtitles: 3 }
 const LIBRARIES = new Map()
 const USERS = new Map()
@@ -215,6 +219,10 @@ const fetchUpdatedMediaItems = async (libraryId, lastUpdatedAt) => {
 
 const evaluateStreams = (streams, filters) => {
     for (const filter of Object.values(filters)) {
+        if (filter === "disabled") {
+            return { id: 0 }
+        }
+
         const { include, exclude } = filter
 
         const defaultStream = streams.find((stream) => {
@@ -384,7 +392,7 @@ const identifyStreamsToUpdate = async (parts, filters) => {
             }
 
             if (subtitles?.onMatch?.audio) {
-                audio = findMatchingAudioStream(part, subtitles.filter.onMatch.audio)
+                audio = findMatchingAudioStream(part, subtitles.onMatch.audio)
             }
 
             if (audio.id) {
