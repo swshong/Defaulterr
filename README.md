@@ -2,6 +2,24 @@
 
 Change the default audio and subtitle streams for items in Plex per user based on codec, language, keywords and more. Customizable with filters and groups. Can run on a schedule or for newly added items using a Tautulli webhook.
 
+## Fork Notes
+
+This is a maintained fork of [varthe/Defaulterr](https://github.com/varthe/Defaulterr) focused on
+keeping dependencies current, patching CVEs, and hardening the runtime. Container images are
+published to [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/container/defaulterr)
+(multi-arch: `linux/amd64`, `linux/arm64`).
+
+Highlights vs upstream: removed a placeholder `fs` dependency, bumped `node-cron`/`winston`/`cron-validator`,
+fixed a runtime crash in the subtitle `on_match` path, added a `- disabled` subtitle fallback, added a
+`/health` endpoint, and rebased the image on `node:24-alpine` running as a non-root user. See
+[CHANGELOG.md](CHANGELOG.md) for the full list.
+
+> **Review note:** This fork was reviewed and verified by **Claude Opus 4.8** (Anthropic) on 2026-06-06 —
+> dependency/CVE audit (0 known vulnerabilities), source review, and a secret/PII scan of the code and git
+> history. Details in [CHANGELOG.md](CHANGELOG.md).
+
+To use this fork, point your image at `ghcr.io/swshong/defaulterr:latest` instead of `varthe/defaulterr:latest`.
+
 ## Getting Started
 
 ### Docker Compose
