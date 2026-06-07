@@ -1,16 +1,16 @@
 <Container version="2">
     <Name>defaulterr</Name>
-    <Repository>varthe/defaulterr:latest</Repository>
-    <Registry>https://hub.docker.com/r/varthe/defaulterr</Registry>
+    <Repository>ghcr.io/swshong/defaulterr:latest</Repository>
+    <Registry>https://github.com/swshong/Defaulterr/pkgs/container/defaulterr</Registry>
     <Network>bridge</Network>
     <MyIP/>
     <Shell>bash</Shell>
     <Privileged>false</Privileged>
-    <Support>https://github.com/varthe/defaulterr/issues</Support>
-    <Project>https://github.com/varthe/defaulterr</Project>
-    <Overview>Change the default audio and subtitle streams for items in Plex per user based on codec, language, keywords, and more</Overview>
+    <Support>https://github.com/swshong/Defaulterr/issues</Support>
+    <Project>https://github.com/swshong/Defaulterr</Project>
+    <Overview>Change the default audio and subtitle streams for items in Plex per user based on codec, language, keywords, and more. Maintained fork of varthe/Defaulterr with updated dependencies and a non-root node:24-alpine image.</Overview>
     <Category>Network:</Category>
-    <TemplateURL>https://raw.githubusercontent.com/varthe/Defaulterr/refs/heads/main/defaulterr.xml</TemplateURL>
+    <TemplateURL>https://raw.githubusercontent.com/swshong/Defaulterr/refs/heads/main/defaulterr.xml</TemplateURL>
     <Config>
         <Volume>
             <HostDir>/mnt/user/appdata/defaulterr/config</HostDir>

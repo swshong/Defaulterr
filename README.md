@@ -27,7 +27,7 @@ To use this fork, point your image at `ghcr.io/swshong/defaulterr:latest` instea
 ```yaml
 services:
   defaulterr:
-    image: varthe/defaulterr:latest
+    image: ghcr.io/swshong/defaulterr:latest
     container_name: defaulterr
     hostname: defaulterr
     ports:
@@ -41,7 +41,7 @@ services:
 ``` 
 
 ### Unraid Template
-Click [here](https://raw.githubusercontent.com/varthe/Defaulterr/refs/heads/main/defaulterr.xml) to download the Unraid template.
+Click [here](https://raw.githubusercontent.com/swshong/Defaulterr/refs/heads/main/defaulterr.xml) to download the Unraid template.
 
 ### Configuration Overview
 
