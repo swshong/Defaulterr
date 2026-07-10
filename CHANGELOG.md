@@ -7,6 +7,23 @@ to [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/con
 All notable changes to this fork (relative to upstream) are documented here.
 Upstream history prior to the fork lives in the [original project](https://github.com/varthe/Defaulterr).
 
+## 2026-07-10
+
+### Security
+
+- Bumped `axios` `1.16.1` → `1.18.1`, pulling in `form-data` `4.0.6` — fixes
+  [GHSA-hmw2-7cc7-3qxx](https://github.com/advisories/GHSA-hmw2-7cc7-3qxx)
+  (high — CRLF injection via unescaped multipart field names).
+- Bumped `js-yaml` `4.1.1` → `4.3.0` — fixes
+  [GHSA-h67p-54hq-rp68](https://github.com/advisories/GHSA-h67p-54hq-rp68)
+  (moderate — quadratic-complexity DoS in merge-key handling).
+- `npm audit`: 0 known vulnerabilities.
+
+### Dependencies
+
+- `node-cron` `4.2.1` → `4.6.0`
+- Lockfile-only refresh of remaining transitive dependencies within existing semver ranges.
+
 ## 2026-06-06
 
 ### Reviewed & patched by Claude Opus 4.8
