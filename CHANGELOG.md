@@ -24,6 +24,24 @@ Upstream history prior to the fork lives in the [original project](https://githu
 - `node-cron` `4.2.1` → `4.6.0`
 - Lockfile-only refresh of remaining transitive dependencies within existing semver ranges.
 
+### Fixed
+
+- **Plex-unreachable retry loop never ran** (`fetchAllLibraries`): when Plex returned no HTTP
+  response at all (connection refused / timeout — e.g. Plex still starting up), `error.response`
+  was `undefined` and the retry loop crashed with
+  `Cannot read properties of undefined (reading 'status')` after the first 30-second wait,
+  leaving the library map empty. The retry loop now genuinely attempts 10 retries at
+  30-second intervals regardless of failure mode. Note this makes the designed
+  exit-after-all-retries path reachable — pair with a container restart policy.
+- **`on_match` sub-filter with no matching stream aborted the whole batch**
+  (`identifyStreamsToUpdate`): the `on_match` reassignments of `audio`/`subtitles` lacked the
+  `|| {}` fallback the initial assignments have, so a non-matching sub-filter threw on `.id`
+  access and every part in the batch was dropped.
+- **`managed_users` were silently skipped when the plex.tv shared-servers call failed**
+  (`fetchAllUsersListedInFilters`): managed-user tokens come from the config and don't depend
+  on plex.tv, but they were registered inside the same `try` block after the plex.tv fetch. They
+  are now registered unconditionally; if that call failing left zero users, the app exited at startup.
+
 ## 2026-06-06
 
 ### Reviewed & patched by Claude Opus 4.8
