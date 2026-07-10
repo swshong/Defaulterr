@@ -9,14 +9,18 @@ keeping dependencies current, patching CVEs, and hardening the runtime. Containe
 published to [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/container/defaulterr)
 (multi-arch: `linux/amd64`, `linux/arm64`).
 
-Highlights vs upstream: removed a placeholder `fs` dependency, bumped `node-cron`/`winston`/`cron-validator`,
-fixed a runtime crash in the subtitle `on_match` path, added a `- disabled` subtitle fallback, added a
-`/health` endpoint, and rebased the image on `node:24-alpine` running as a non-root user. See
-[CHANGELOG.md](CHANGELOG.md) for the full list.
+Highlights vs upstream: removed a placeholder `fs` dependency, patched CVE advisories in the dependency
+tree (`npm audit`: 0 known vulnerabilities), fixed runtime crashes in the Plex retry, `on_match`, and
+managed-users paths, added a `- disabled` subtitle fallback, added a `/health` endpoint, and rebased the
+image on `node:24-alpine` running as a non-root user. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
-> **Review note:** This fork was reviewed and verified by **Claude Opus 4.8** (Anthropic) on 2026-06-06 —
+> **Review notes:** This fork was reviewed and verified by **Claude Opus 4.8** (Anthropic) on 2026-06-06 —
 > dependency/CVE audit (0 known vulnerabilities), source review, and a secret/PII scan of the code and git
-> history. Details in [CHANGELOG.md](CHANGELOG.md).
+> history. On 2026-07-10, **Claude Fable 5** (Anthropic) re-audited the dependency tree (patching a high-severity
+> `form-data` CRLF-injection advisory pulled in via `axios`, and a moderate `js-yaml` DoS advisory) and found,
+> fixed, and smoke-verified three upstream-inherited runtime bugs — a broken Plex-unreachable retry loop, an
+> `on_match` crash that dropped whole batches, and `managed_users` being lost when plex.tv was unreachable.
+> Details in [CHANGELOG.md](CHANGELOG.md).
 
 To use this fork, point your image at `ghcr.io/swshong/defaulterr:latest` instead of `varthe/defaulterr:latest`.
 

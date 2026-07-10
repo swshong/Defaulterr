@@ -9,6 +9,26 @@ Upstream history prior to the fork lives in the [original project](https://githu
 
 ## 2026-07-10
 
+### Reviewed & patched by Claude Fable 5
+
+This fork was re-reviewed and patched by **Claude Fable 5** (Anthropic) on 2026-07-10.
+The pass covered:
+
+- **Dependency / CVE audit** — two advisories published since the June review were patched
+  (see Security below); `npm audit` against the production tree is back to **0 known vulnerabilities**.
+- **Upstream drift check** — upstream `varthe/Defaulterr` has no new commits since the fork
+  point; nothing to merge.
+- **Source review** of `main.js`, `configBuilder.js`, and `logger.js` — found and fixed three
+  upstream-inherited runtime bugs (see Fixed below). Each was reproduced or verified with live
+  smoke runs before and after the fix.
+- **Build currency** — `node:24-alpine` base image (current LTS) and CI action versions
+  confirmed up to date. Major upgrades deliberately deferred (Express 5, js-yaml 5, ESLint 10):
+  breaking changes with no security payoff for this app.
+
+Shipped as [PR #5](https://github.com/swshong/Defaulterr/pull/5) (dependencies) and
+[PR #6](https://github.com/swshong/Defaulterr/pull/6) (bug fixes). Published image tags:
+`v2.4.11-fork.1` (dependency patches only) and **`v2.4.11-fork.2`** (dependency patches + bug fixes).
+
 ### Security
 
 - Bumped `axios` `1.16.1` → `1.18.1`, pulling in `form-data` `4.0.6` — fixes
@@ -95,4 +115,4 @@ The fork's divergence from upstream, as it stands at this review, is catalogued 
 
 ---
 
-_Reviewed and documented with assistance from Claude Opus 4.8._
+_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06) and Claude Fable 5 (2026-07-10)._
