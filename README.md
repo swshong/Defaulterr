@@ -14,13 +14,17 @@ tree (`npm audit`: 0 known vulnerabilities), fixed runtime crashes in the Plex r
 managed-users paths, added a `- disabled` subtitle fallback, added a `/health` endpoint, and rebased the
 image on `node:24-alpine` running as a non-root user. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
-> **Review notes:** This fork was reviewed and verified by **Claude Opus 4.8** (Anthropic) on 2026-06-06 —
-> dependency/CVE audit (0 known vulnerabilities), source review, and a secret/PII scan of the code and git
-> history. On 2026-07-10, **Claude Fable 5** (Anthropic) re-audited the dependency tree (patching a high-severity
-> `form-data` CRLF-injection advisory pulled in via `axios`, and a moderate `js-yaml` DoS advisory) and found,
-> fixed, and smoke-verified three upstream-inherited runtime bugs — a broken Plex-unreachable retry loop, an
-> `on_match` crash that dropped whole batches, and `managed_users` being lost when plex.tv was unreachable.
-> Details in [CHANGELOG.md](CHANGELOG.md).
+> **Review notes:** This fork is maintained with recurring review passes by Claude (Anthropic). Each pass
+> audits the dependency tree for advisories, checks upstream drift and base-image/CI currency, and reviews
+> the source for correctness. Fixes are verified with live smoke runs before release.
+>
+> | Date | Reviewer | Outcome |
+> | --- | --- | --- |
+> | 2026-06-06 | Claude Opus 4.8 | Initial audit, secret/PII scan, removed a placeholder `fs` dependency |
+> | 2026-07-10 | Claude Fable 5 | Patched `form-data` (high) and `js-yaml` (moderate); fixed 3 runtime bugs |
+> | 2026-08-05 | Claude Opus 5 | Patched `fast-uri` (2× high) and `brace-expansion` (high) |
+>
+> `npm audit` is kept at **0 known vulnerabilities**. Per-pass detail in [CHANGELOG.md](CHANGELOG.md).
 
 To use this fork, point your image at `ghcr.io/swshong/defaulterr:latest` instead of `varthe/defaulterr:latest`.
 
