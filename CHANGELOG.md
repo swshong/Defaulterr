@@ -7,6 +7,44 @@ to [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/con
 All notable changes to this fork (relative to upstream) are documented here.
 Upstream history prior to the fork lives in the [original project](https://github.com/varthe/Defaulterr).
 
+## 2026-08-05
+
+### Reviewed & patched by Claude Opus 5
+
+Routine maintenance pass by **Claude Opus 5** (Anthropic) on 2026-08-05, covering the
+dependency tree, base image, CI actions, upstream drift, and the deployed container.
+
+### Security
+
+- `ajv` `8.17.1` → `8.20.0`, pulling `fast-uri` `3.1.3` → `3.1.5` — fixes two **high**-severity
+  host-confusion advisories, [GHSA-v2hh-gcrm-f6hx](https://github.com/advisories/GHSA-v2hh-gcrm-f6hx)
+  (literal backslash authority delimiter) and
+  [GHSA-7p8r-x3mc-p8w7](https://github.com/advisories/GHSA-7p8r-x3mc-p8w7) (backslash authority
+  introducer). Production dependency, reached via `ajv`'s schema-URI parsing.
+- `brace-expansion` `1.1.16` → `1.1.18` — fixes
+  [GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg) (**high** — DoS via
+  unbounded expansion causing an OOM crash). Dev-only, reached via `minimatch` in the ESLint tree.
+- `npm audit`: **0 known vulnerabilities**, production tree and full tree.
+
+### Dependencies
+
+- `axios` `1.18.1` → `1.19.0`
+- `js-yaml` `4.3.0` → `4.3.1`
+- `eslint` / `@eslint/js` `9.39.4` → `9.39.5`
+- Rebuilding the image also picks up Node `24.19.0` (released 2026-08-03) and current Alpine
+  package patches. Node 24 "Krypton" remains the active LTS line; Node 25/26 are non-LTS and
+  deliberately not adopted.
+
+### Build & CI
+
+- `actions/checkout` `v6` → `v7`. All other pinned actions (`setup-buildx@v4`, `login@v4`,
+  `metadata@v6`, `build-push@v7`) are already on their current major.
+
+### Deferred
+
+Major upgrades remain deliberately unadopted — breaking changes with no security benefit for
+this app: Express 5, js-yaml 5, ESLint 10, globals 17.
+
 ## 2026-07-10
 
 ### Reviewed & patched by Claude Fable 5
@@ -115,4 +153,4 @@ The fork's divergence from upstream, as it stands at this review, is catalogued 
 
 ---
 
-_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06) and Claude Fable 5 (2026-07-10)._
+_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06), Claude Fable 5 (2026-07-10), and Claude Opus 5 (2026-08-05)._
