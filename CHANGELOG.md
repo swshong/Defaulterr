@@ -7,6 +7,57 @@ to [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/con
 All notable changes to this fork (relative to upstream) are documented here.
 Upstream history prior to the fork lives in the [original project](https://github.com/varthe/Defaulterr).
 
+## 2026-10-16
+
+### Reviewed & patched by Claude Opus 5
+
+Maintenance pass by **Claude Opus 5** (Anthropic) on 2026-10-16. This was the largest advisory
+batch since the fork began — **9 advisories (1 critical, 4 high, 4 moderate)** had accumulated,
+8 of them in the production tree. All were resolved by an in-range `npm update`, with no
+`package.json` changes.
+
+### Security
+
+- **`proxy-addr` `2.0.7` → `2.0.8` (CRITICAL)** — IP spoofing via IPv4-mapped IPv6 trust subnet
+  ([GHSA-jqcg-44mw-7w3h](https://github.com/advisories/GHSA-jqcg-44mw-7w3h)). Reached via Express.
+  Defaulterr does not enable `trust proxy` or make decisions on `req.ip`, so practical exposure here
+  is minimal — patched regardless.
+- **`axios` `1.19.0` → `1.20.0`** — clears **12** advisories at once, including redirect-based SSRF
+  with `maxRedirects: 0` ([GHSA-r4gj-5m52-g5wh](https://github.com/advisories/GHSA-r4gj-5m52-g5wh)),
+  an HTTP/2 adapter bypassing configured DNS and proxy controls
+  ([GHSA-3pq3-5fj3-cg6v](https://github.com/advisories/GHSA-3pq3-5fj3-cg6v)), two prototype-pollution
+  gadgets reachable through adapter options
+  ([GHSA-m8m8-qj5v-23w3](https://github.com/advisories/GHSA-m8m8-qj5v-23w3),
+  [GHSA-x97p-jq2g-jp4f](https://github.com/advisories/GHSA-x97p-jq2g-jp4f)), and two ReDoS paths that
+  can freeze the Node event loop
+  ([GHSA-c29m-xwm3-cm6r](https://github.com/advisories/GHSA-c29m-xwm3-cm6r),
+  [GHSA-mghh-pgcx-3jjj](https://github.com/advisories/GHSA-mghh-pgcx-3jjj)).
+- **`fast-uri` `3.1.5` → `3.1.8`** — six advisories covering SSRF via malformed IPv6 normalization
+  and repeated percent-decoding, plus host-confusion and authority-injection variants. Reached via
+  `ajv`'s schema-URI parsing.
+- **`js-yaml` `4.3.1` → `4.3.2`** — unbounded CPU use for empty merge sources
+  ([GHSA-2883-xcg3-v3hh](https://github.com/advisories/GHSA-2883-xcg3-v3hh)).
+- **`qs` → `6.16.1`** — array-limit bypass and attacker-controlled `isBuffer` DoS. Via Express.
+- **`moment` → `2.31.0`** — path traversal via crafted non-string locale name. Via
+  `winston-daily-rotate-file`.
+- **`brace-expansion` → `1.1.21`** — three recursion/quadratic-expansion DoS advisories. Dev-only
+  tree, via `minimatch`.
+- **`express` `4.22.2` → `4.22.3`** — carries the `proxy-addr` and `qs` fixes.
+- `npm audit`: **0 known vulnerabilities**, production tree and full tree.
+
+### Dependencies
+
+- Rebuilding the image also picks up Node **24.22.0** (released 2026-10-14) and current Alpine
+  package patches. Node 24 "Krypton" remains the active LTS line.
+
+### Checked, no change required
+
+- **Upstream drift** — `varthe/Defaulterr` still has no commits since the fork point.
+- **CI actions** — `checkout@v7`, `setup-buildx@v4`, `login@v4`, `metadata@v6`, `build-push@v7` are
+  all on their current majors.
+- **Deferred majors**, unchanged from previous passes: Express 5, js-yaml 5, ESLint 10, globals 17 —
+  breaking changes with no security benefit for this app, now that 4.x/9.x carry the fixes.
+
 ## 2026-08-05
 
 ### Reviewed & patched by Claude Opus 5
