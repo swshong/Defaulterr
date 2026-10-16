@@ -204,4 +204,4 @@ The fork's divergence from upstream, as it stands at this review, is catalogued 
 
 ---
 
-_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06), Claude Fable 5 (2026-07-10), and Claude Opus 5 (2026-08-05)._
+_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06), Claude Fable 5 (2026-07-10), and Claude Opus 5 (2026-08-05, 2026-08-20, 2026-10-16)._
