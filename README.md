@@ -551,6 +551,8 @@ the `- disabled` subtitle fallback; added a `/health` endpoint; and rebased the 
 > | 2026-06-06 | Claude Opus 4.8 | Initial audit, secret/PII scan, removed a placeholder `fs` dependency |
 > | 2026-07-10 | Claude Fable 5 | Patched `form-data` (high) and `js-yaml` (moderate); fixed 3 runtime bugs |
 > | 2026-08-05 | Claude Opus 5 | Patched `fast-uri` (2× high) and `brace-expansion` (high) |
+> | 2026-08-20 | Claude Opus 5 | Rewrote this README; fixed two config examples that failed validation |
+> | 2026-10-16 | Claude Opus 5 | Cleared 9 advisories incl. critical `proxy-addr` IP spoofing and 12 `axios` CVEs |
 >
 > `npm audit` is kept at **0 known vulnerabilities**. Per-pass detail in [CHANGELOG.md](CHANGELOG.md).
 
