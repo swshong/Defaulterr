@@ -27,6 +27,7 @@ const timestampsFile = process.argv[4] || "./last_run_timestamps.json"
 // Pacing knobs. The defaults are deliberately gentle on Plex; the overrides exist for tests.
 const STEP_DELAY_MS = Number(process.env.DEFAULTERR_STEP_DELAY_MS ?? 100)
 const RETRY_DELAY_MS = Number(process.env.DEFAULTERR_RETRY_DELAY_MS ?? 30000)
+const USER_REFRESH_MS = Number(process.env.DEFAULTERR_USER_REFRESH_MS ?? 15 * 60 * 1000)
 const MAX_QUEUE = Number(process.env.DEFAULTERR_MAX_QUEUE ?? 100)
 const PLEX_TV_URL = (process.env.DEFAULTERR_PLEX_TV_URL || "https://plex.tv").replace(/\/$/, "")
 
@@ -74,44 +75,55 @@ const getUserDetailsFromXml = async (xml) => {
     }
 }
 
-// Fetch all users listed in filters
-const fetchAllUsersListedInFilters = async () => {
-    try {
-        if (!config.plex_client_identifier) throw new Error("Client identifier not supplied in config")
-        const response = await axios.get(
-            `${PLEX_TV_URL}/api/servers/${config.plex_client_identifier}/shared_servers`,
-            {
-                headers: {
-                    "X-Plex-Token": config.plex_owner_token,
-                    Accept: "application/json",
-                },
-                timeout: 30000,
-                maxRedirects: 0,
-            }
-        )
-        const filterUsernames = new Set(Object.values(config.groups).flat())
-        const users = await getUserDetailsFromXml(response.data)
-        users.forEach((user) => {
-            if (filterUsernames.has(user.username) || filterUsernames.has("$ALL")) {
-                USERS.set(user.username, user.accessToken)
-            }
-        })
-        logger.info("Fetched and stored user details successfully.")
-    } catch (error) {
-        logger.warn(`Could not fetch users with access to server: ${error.message}`)
+// Users shared on the server, as last reported by plex.tv
+let sharedUsers = new Map()
+let usersFetchedAt = 0
+// `${libraryId}:${username}` -> { ok, at }
+const accessCache = new Map()
+
+// Rebuild USERS from the owner, plex.tv's shared-user list and managed_users.
+// Called before every run and webhook, and refreshed from plex.tv at most every
+// USER_REFRESH_MS, so people added to (or removed from) the server are picked up without a
+// restart. If plex.tv cannot be reached the last known shared users are kept.
+const refreshUsers = async ({ force = false } = {}) => {
+    if (force || Date.now() - usersFetchedAt >= USER_REFRESH_MS) {
+        try {
+            const response = await axios.get(
+                `${PLEX_TV_URL}/api/servers/${encodeURIComponent(config.plex_client_identifier)}/shared_servers`,
+                {
+                    headers: {
+                        "X-Plex-Token": config.plex_owner_token,
+                        Accept: "application/json",
+                    },
+                    timeout: 30000,
+                    maxRedirects: 0,
+                }
+            )
+            const filterUsernames = new Set(Object.values(config.groups).flat())
+            const users = await getUserDetailsFromXml(response.data)
+            sharedUsers = new Map(
+                users
+                    .filter((user) => filterUsernames.has(user.username) || filterUsernames.has("$ALL"))
+                    .map((user) => [user.username, user.accessToken])
+            )
+            const firstFetch = usersFetchedAt === 0
+            usersFetchedAt = Date.now()
+            accessCache.clear()
+            logger[firstFetch ? "info" : "debug"]("Fetched and stored user details successfully.")
+        } catch (error) {
+            logger.warn(
+                `Could not fetch users with access to server: ${error.message}. Keeping the ${sharedUsers.size} already known.`
+            )
+        }
     }
 
-    // Managed user tokens come from the config, not plex.tv — register them even if the fetch above failed
-    const managedUsers = config.managed_users
-    if (managedUsers) {
-        Object.keys(managedUsers).forEach((user) => {
-            const token = managedUsers[user]
-            if (user && token) {
-                USERS.set(user, token)
-            }
-        })
-        logger.info(`Finished processing managed users`)
-    }
+    USERS.clear()
+    if (config.plex_owner_name) USERS.set(config.plex_owner_name, config.plex_owner_token)
+    sharedUsers.forEach((token, username) => USERS.set(username, token))
+    // Managed user tokens come from the config, not plex.tv, and take precedence
+    Object.entries(config.managed_users || {}).forEach(([user, token]) => {
+        if (user && token) USERS.set(user, token)
+    })
 }
 
 // Verify each token can access the API endpoint
@@ -127,21 +139,31 @@ const fetchUsersWithAccess = async (libraryName) => {
             usernames = [...USERS.keys()]
         }
         for (const username of usernames) {
-            const token = USERS.get(username)
+            // The same user is usually in several groups; ask Plex once and remember the answer
+            const cacheKey = `${id}:${username}`
+            const cached = accessCache.get(cacheKey)
+            if (cached && Date.now() - cached.at < USER_REFRESH_MS) {
+                if (cached.ok) users.push(username)
+                continue
+            }
             try {
-                const response = await axiosInstance.get(`/library/sections/${id}`, {
-                    headers: { "X-Plex-Token": token },
+                await axiosInstance.get(`/library/sections/${id}`, {
+                    headers: { "X-Plex-Token": USERS.get(username) },
                     timeout: 30000,
                 })
-                if (response.status !== 200) throw new Error(`Unexpected response status: ${response.status}`)
                 logger.debug(
                     `Checking if user ${username} of group ${group} has access to library ${libraryName}... OK`
                 )
+                accessCache.set(cacheKey, { ok: true, at: Date.now() })
                 users.push(username)
             } catch (error) {
                 logger.warn(
                     `User ${username} of group ${group} can't access library ${libraryName}. They will be skipped during updates. ${error.message}`
                 )
+                // Remember a definite "no", but not a network error or a Plex hiccup
+                if ([401, 403, 404].includes(error.response?.status)) {
+                    accessCache.set(cacheKey, { ok: false, at: Date.now() })
+                }
             }
             await delay(STEP_DELAY_MS)
         }
@@ -194,15 +216,23 @@ const fetchAllLibraries = async () => {
         })
         const libraries = data?.MediaContainer?.Directory || []
 
+        // Build the new map fully before swapping it in, and never let one bad entry stop the rest
+        const mapped = new Map()
         for (const libraryName in config.filters) {
             const library = libraries.find((lib) => lib.title.toLowerCase() === libraryName.toLowerCase())
-            if (!library) throw new Error(`Library '${libraryName}' not found in Plex response`)
-            if (library.type !== "movie" && library.type !== "show")
-                throw new Error(`Invalid library type '${library.type}'. Must be 'movie' or 'show'`)
-
-            LIBRARIES.set(library.key, { name: library.title, type: library.type })
+            if (!library) {
+                logger.error(`Library '${libraryName}' not found in Plex. Check its name under 'filters'. Skipping it.`)
+                continue
+            }
+            if (library.type !== "movie" && library.type !== "show") {
+                logger.error(`Library '${libraryName}' has type '${library.type}'. Only 'movie' and 'show' are supported. Skipping it.`)
+                continue
+            }
+            mapped.set(library.key, { name: library.title, type: library.type })
             logger.debug(`Mapped library: ${library.title} (ID: ${library.key}, Type: ${library.type})`)
         }
+        LIBRARIES.clear()
+        mapped.forEach((details, key) => LIBRARIES.set(key, details))
 
         logger.info("Fetched and mapped libraries")
     } catch (error) {
@@ -212,16 +242,25 @@ const fetchAllLibraries = async () => {
 
 // Load last run timestamps from the file
 const loadLastRunTimestamps = () => {
-    if (fs.existsSync(timestampsFile)) {
-        const data = fs.readFileSync(timestampsFile, "utf-8")
-        return JSON.parse(data)
+    if (!fs.existsSync(timestampsFile)) return {}
+    try {
+        const parsed = JSON.parse(fs.readFileSync(timestampsFile, "utf-8"))
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object")
+        return parsed
+    } catch (error) {
+        logger.warn(
+            `Timestamps file ${timestampsFile} is unreadable (${error.message}). Treating every library as never processed.`
+        )
+        return {}
     }
-    return {}
 }
 
-// Save the new last run timestamps to the file
+// Save the new last run timestamps to the file. Written to a temp file and renamed into
+// place, so a crash or full disk mid-write cannot leave a truncated file behind.
 const saveLastRunTimestamps = (timestamps) => {
-    fs.writeFileSync(timestampsFile, JSON.stringify(timestamps, null, 2), "utf-8")
+    const tempFile = `${timestampsFile}.tmp`
+    fs.writeFileSync(tempFile, JSON.stringify(timestamps, null, 2), "utf-8")
+    fs.renameSync(tempFile, timestampsFile)
 }
 
 const PAGE_SIZE = 500
@@ -539,6 +578,7 @@ const performDryRun = async () => {
 
 // Partial run: process items updated since last run
 const performPartialRun = async (cleanRun) => {
+    await refreshUsers()
     await fetchAllLibraries()
 
     logger.info(`STARTING ${cleanRun ? "CLEAN" : "PARTIAL"} RUN`)
@@ -601,6 +641,7 @@ const secretMatches = (provided) => {
 
 const handleWebhook = async (type, libraryId, mediaId) => {
     logger.info(`Tautulli webhook received for ${type} ${mediaId}. Processing...`)
+    await refreshUsers()
 
     let libraryName = LIBRARIES.get(libraryId)?.name
     if (!libraryName) {
@@ -670,10 +711,7 @@ const PORT = process.env.PORT || 3184
 app.listen(PORT, async () => {
     logger.info(`Server is running on port ${PORT}`)
     try {
-        if (config.plex_owner_name) {
-            USERS.set(config.plex_owner_name, config.plex_owner_token)
-        }
-        await fetchAllUsersListedInFilters()
+        await refreshUsers({ force: true })
         if (USERS.size === 0) throw new Error("No users with access to libraries detected")
 
         if (config.dry_run) await performDryRun()
