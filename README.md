@@ -549,7 +549,8 @@ currency, CVE patching, and runtime hardening. Images publish to
 [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/container/defaulterr).
 
 Changes vs upstream: removed a placeholder `fs` dependency; patched CVE advisories across the
-dependency tree; fixed runtime crashes in the Plex retry, `on_match`, and managed-users paths; added
+dependency tree; fixed runtime crashes in the Plex retry, `on_match`, and managed-users paths; made
+scheduled runs detect changed episodes; validated and optionally authenticated the webhook; added
 the `- disabled` subtitle fallback; added a `/health` endpoint; and rebased the image on
 `node:24-alpine` running as a non-root user. Full detail in [CHANGELOG.md](CHANGELOG.md).
 
@@ -564,6 +565,7 @@ the `- disabled` subtitle fallback; added a `/health` endpoint; and rebased the 
 > | 2026-08-05 | Claude Opus 5 | Patched `fast-uri` (2× high) and `brace-expansion` (high) |
 > | 2026-08-20 | Claude Opus 5 | Rewrote this README; fixed two config examples that failed validation |
 > | 2026-10-16 | Claude Opus 5 | Cleared 9 advisories incl. critical `proxy-addr` IP spoofing and 12 `axios` CVEs |
+> | 2026-11-10 | Claude Fable 5.2 | Four-pass review: fixed missed episode changes, hardened the webhook, added a 31-test suite |
 >
 > `npm audit` is kept at **0 known vulnerabilities**. Per-pass detail in [CHANGELOG.md](CHANGELOG.md).
 
