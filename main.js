@@ -36,7 +36,11 @@ const axiosInstance = axios.create({
     headers: {
         "X-Plex-Token": config.plex_owner_token,
     },
-    timeout: 600000,
+    timeout: 120000,
+    // Plex never redirects API calls. Refusing redirects means the X-Plex-Token header
+    // (which, unlike Authorization, is not stripped on a cross-host redirect) cannot be
+    // carried to another host.
+    maxRedirects: 0,
 })
 
 // Utility to handle error logging
@@ -81,6 +85,8 @@ const fetchAllUsersListedInFilters = async () => {
                     "X-Plex-Token": config.plex_owner_token,
                     Accept: "application/json",
                 },
+                timeout: 30000,
+                maxRedirects: 0,
             }
         )
         const filterUsernames = new Set(Object.values(config.groups).flat())
@@ -123,8 +129,9 @@ const fetchUsersWithAccess = async (libraryName) => {
         for (const username of usernames) {
             const token = USERS.get(username)
             try {
-                const response = await axios.get(`${config.plex_server_url}/library/sections/${id}`, {
+                const response = await axiosInstance.get(`/library/sections/${id}`, {
                     headers: { "X-Plex-Token": token },
+                    timeout: 30000,
                 })
                 if (response.status !== 200) throw new Error(`Unexpected response status: ${response.status}`)
                 logger.debug(
