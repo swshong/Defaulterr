@@ -351,82 +351,108 @@ const identifyStreamsToUpdate = async (parts, filters) => {
     }
 }
 
-// Update default streams for a single item across all relevant users
-const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
-    for (const group in streamsToUpdate) {
-        for (const stream of streamsToUpdate[group]) {
-            const usernames = users.get(group)
-            if (usernames.length === 0) {
-                logger.warn(`No users found in group '${group}'. Skipping update.`)
-                continue
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
+const MAX_UPDATE_ATTEMPTS = 4
+
+// Honour a Retry-After header given in seconds, capped so a bad value cannot stall a run
+const retryAfterMs = (error) => {
+    const seconds = Number(error.response?.headers?.["retry-after"])
+    return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 300) * 1000 : undefined
+}
+
+// Set the default streams on one part for one user. Resolves true on success, false otherwise.
+// Network errors, 429 and 5xx are retried with backoff. Any other 4xx is permanent for this
+// user and part (no access, age rating, item replaced under us), so it is reported once and
+// skipped rather than retried. Nothing in here ends the process.
+const postStreamUpdate = async (stream, username, group, token) => {
+    const queryParams = new URLSearchParams()
+    if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
+    if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
+    const what = [
+        stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : "",
+        stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : "",
+    ]
+        .filter(Boolean)
+        .join(" and ")
+    const target = `part ${stream.partId} for user ${username} in group ${group}`
+
+    if (config.dry_run) {
+        logger.info(`DRY RUN: would set ${what} on ${target}`)
+        return true
+    }
+
+    for (let attempt = 1; attempt <= MAX_UPDATE_ATTEMPTS; attempt++) {
+        try {
+            await axiosInstance.post(
+                `/library/parts/${stream.partId}?${queryParams.toString()}`,
+                {},
+                { headers: { "X-Plex-Token": token } }
+            )
+            logger.debug(`Update ${what} on ${target}: SUCCESS`)
+            return true
+        } catch (error) {
+            const status = error.response?.status
+            const reason = status ? `HTTP ${status}` : error.message
+            const retryable = !error.response || RETRYABLE_STATUS.has(status)
+            if (!retryable || attempt === MAX_UPDATE_ATTEMPTS) {
+                logger.warn(
+                    `Update ${what} on ${target}: FAILED (${reason})${
+                        status === 403
+                            ? ". This could be because of age ratings, ensure they can access ALL items in the library"
+                            : ""
+                    }`
+                )
+                return false
             }
+            const wait = retryAfterMs(error) ?? RETRY_DELAY_MS * attempt
+            logger.warn(
+                `Update on ${target} failed (${reason}). Retry ${attempt}/${MAX_UPDATE_ATTEMPTS - 1} in ${Math.round(wait / 1000)}s`
+            )
+            await delay(wait)
+        }
+    }
+    return false
+}
+
+// Apply one part's updates. Groups are applied in config order, so a group listed later
+// deliberately overrides an earlier one for users who are in both.
+const applyUpdates = async (updatesByGroup, usersWithAccess) => {
+    for (const [group, streams] of Object.entries(updatesByGroup)) {
+        const usernames = usersWithAccess.get(group) || []
+        if (usernames.length === 0) {
+            logger.warn(`No users found in group '${group}'. Skipping update.`)
+            continue
+        }
+        for (const stream of streams) {
+            let succeeded = 0
             for (const username of usernames) {
                 const token = USERS.get(username)
                 if (!token) {
                     logger.warn(`No access token found for user ${username}. Skipping update.`)
                     continue
                 }
-                const queryParams = new URLSearchParams()
-                if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
-                if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
-
-                try {
-                    const response = await axiosInstance
-                        .post(
-                            `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                            {},
-                            { headers: { "X-Plex-Token": token } }
-                        )
-                        .catch(async (error) => {
-                            logger.error(
-                                `Error while posting update for user ${username} in group ${group}${
-                                    error.status === 403
-                                        ? ". This could be because of age ratings, ensure they can access ALL items in the library"
-                                        : ""
-                                }: ${error.message}. Retrying in 30 sec...`
-                            )
-                            await delay(RETRY_DELAY_MS)
-                            let responseStatus = ""
-                            let attempt = 1
-                            while (responseStatus !== 200 && attempt < 10) {
-                                await axiosInstance
-                                    .post(
-                                        `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                                        {},
-                                        { headers: { "X-Plex-Token": token } }
-                                    )
-                                    .then((response) => (responseStatus = response.status))
-                                    .catch((error) => {
-                                        logger.error(
-                                            `Attempt ${attempt}/10 failed with error: ${error.message}. Retrying in 30 sec...`
-                                        )
-                                    })
-                                if (responseStatus !== 200) {
-                                    attempt++
-                                    await delay(RETRY_DELAY_MS)
-                                }
-                            }
-                            if (responseStatus !== 200) {
-                                logger.error("All attemps failed. Exiting application.")
-                                process.exit(1)
-                            }
-                        })
-
-                    const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
-                    const subtitleMessage = stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : ""
-                    const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
-                    logger.debug(
-                        `Update ${updateMessage} for user ${username} in group ${group}: ${
-                            response.status === 200 ? "SUCCESS" : "FAIL"
-                        }`
-                    )
-                } catch (error) {
-                    handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
-                }
+                if (await postStreamUpdate(stream, username, group, token)) succeeded++
                 await delay(STEP_DELAY_MS)
             }
-            logger.info(`Part ID ${stream.partId}: update complete for group ${group}`)
+            logger.info(`Part ID ${stream.partId}: group ${group} updated for ${succeeded}/${usernames.length} users`)
         }
+    }
+}
+
+// Evaluate every group's filters against each part and apply the result.
+// With usersWithAccess === null this only evaluates and logs (the startup dry run).
+const processParts = async (parts, libraryName, usersWithAccess) => {
+    const groupFilters = config.filters[libraryName]
+    for (const part of parts) {
+        const updatesByGroup = {}
+        for (const group in groupFilters) {
+            const matchedStreams = await identifyStreamsToUpdate([part], groupFilters[group])
+            if (matchedStreams.length > 0) updatesByGroup[group] = matchedStreams
+        }
+        if (usersWithAccess && Object.keys(updatesByGroup).length > 0) {
+            await applyUpdates(updatesByGroup, usersWithAccess)
+        }
+        await delay(STEP_DELAY_MS)
     }
 }
 
@@ -440,41 +466,10 @@ const identifyStreamsForDryRun = async () => {
             continue
         }
         const updatedItems = await fetchUpdatedMediaItems(id, 0)
-
-        if (type === "movie") {
-            for (const item of updatedItems) {
-                const { title, ratingKey } = item;
-                logger.info(`Fetching streams for ${type} '${title}'`)
-                const stream = await fetchStreamsForItem(ratingKey)
-                const groupFilters = config.filters[libraryName]
-                const newStreams = {}
-
-                for (const group in groupFilters) {
-                    const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                    if (matchedStreams.length > 0) {
-                        newStreams[group] = matchedStreams
-                    }
-                }
-                await delay(STEP_DELAY_MS)
-            }
-        } else if (type === "show") {
-            for (const item of updatedItems) {
-                const { title, ratingKey } = item;
-                logger.info(`Fetching streams for ${type} '${title}'`)
-                const showStreams = await fetchStreamsForShow(ratingKey)
-                for (const stream of showStreams) {
-                    const groupFilters = config.filters[libraryName]
-                    const newStreams = {}
-
-                    for (const group in groupFilters) {
-                        const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                        if (matchedStreams.length > 0) {
-                            newStreams[group] = matchedStreams
-                        }
-                    }
-                    await delay(STEP_DELAY_MS)
-                }
-            }
+        for (const item of updatedItems) {
+            logger.info(`Fetching streams for ${type} '${item.title}'`)
+            const parts = type === "movie" ? [await fetchStreamsForItem(item.ratingKey)] : await fetchStreamsForShow(item.ratingKey)
+            await processParts(parts, libraryName, null)
         }
     }
 }
@@ -518,48 +513,9 @@ const performPartialRun = async (cleanRun) => {
             continue
         }
 
-        if (type === "movie") {
-            for (const item of updatedItems) {
-                const stream = await fetchStreamsForItem(item.ratingKey)
-                const groupFilters = config.filters[libraryName]
-                const newStreams = {}
-
-                for (const group in groupFilters) {
-                    const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                    if (matchedStreams.length > 0) {
-                        newStreams[group] = matchedStreams
-                    }
-                }
-
-                if (Object.keys(newStreams).length > 0) {
-                    await updateDefaultStreamsPerItem(newStreams, config.filters[libraryName], usersWithAccess)
-                }
-
-                // Optional: Delay between processing each item to reduce load
-                await delay(STEP_DELAY_MS)
-            }
-        } else if (type === "show") {
-            for (const item of updatedItems) {
-                const showStreams = await fetchStreamsForShow(item.ratingKey)
-                for (const stream of showStreams) {
-                    const groupFilters = config.filters[libraryName]
-                    const newStreams = {}
-
-                    for (const group in groupFilters) {
-                        const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                        if (matchedStreams.length > 0) {
-                            newStreams[group] = matchedStreams
-                        }
-                    }
-
-                    if (Object.keys(newStreams).length > 0) {
-                        await updateDefaultStreamsPerItem(newStreams, config.filters[libraryName], usersWithAccess)
-                    }
-
-                    // Optional: Delay between processing each stream to reduce load
-                    await delay(STEP_DELAY_MS)
-                }
-            }
+        for (const item of updatedItems) {
+            const parts = type === "movie" ? [await fetchStreamsForItem(item.ratingKey)] : await fetchStreamsForShow(item.ratingKey)
+            await processParts(parts, libraryName, usersWithAccess)
         }
 
         // Update the timestamp for the current library
@@ -595,71 +551,16 @@ app.post("/webhook", async (req, res) => {
         }
 
         const usersWithAccess = await fetchUsersWithAccess(libraryName)
-        const filters = config.filters[libraryName]
 
-        let streams = [] // Need arrays for identifyStreamsToUpdate
+        let parts = []
         if (type === "movie" || type === "episode") {
-            streams = [await fetchStreamsForItem(mediaId)]
+            parts = [await fetchStreamsForItem(mediaId)]
         } else if (type === "show") {
-            streams = await fetchStreamsForShow(mediaId)
+            parts = await fetchStreamsForShow(mediaId)
         } else if (type === "season") {
-            streams = await fetchStreamsForSeason(mediaId)
+            parts = await fetchStreamsForSeason(mediaId)
         }
-        // else do nothing
-
-        const updates = []
-        for (const group in filters) {
-            const newStreams = await identifyStreamsToUpdate(streams, filters[group])
-            if (!newStreams || newStreams.length === 0) {
-                logger.info("Could not find streams to update. Ending request")
-                continue
-            }
-            updates.push({ group, newStreams })
-        }
-
-        for (const { group, newStreams } of updates) {
-            let usernames = usersWithAccess.get(group)
-            if (usernames.length === 0) {
-                logger.warn(`No users found in group '${group}'. Skipping update.`)
-                continue
-            }
-
-            for (const username of usernames) {
-                const token = USERS.get(username)
-                if (!token) {
-                    logger.warn(`No access token found for user '${username}'. Skipping update.`)
-                    continue
-                }
-
-                for (const stream of newStreams) {
-                    const queryParams = new URLSearchParams()
-                    if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
-                    if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
-
-                    try {
-                        const response = await axiosInstance.post(
-                            `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                            {},
-                            { headers: { "X-Plex-Token": token } }
-                        )
-
-                        const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
-                        const subtitleMessage = stream.subtitleStreamId ? `Subtitle ID ${stream.subtitleStreamId}` : ""
-                        const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
-                        logger.info(
-                            `Update ${updateMessage} for user ${username} in group ${group}: ${
-                                response.status === 200 ? "SUCCESS" : "FAIL"
-                            }`
-                        )
-                    } catch (error) {
-                        handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
-                    }
-
-                    // Optional: Delay between posting each update to reduce load
-                    await delay(STEP_DELAY_MS)
-                }
-            }
-        }
+        await processParts(parts, libraryName, usersWithAccess)
 
         logger.info("Tautulli webhook finished")
         return res.status(200).send("Webhook received and processed.")
