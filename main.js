@@ -1,4 +1,5 @@
 const express = require("express")
+const crypto = require("crypto")
 const fs = require("fs")
 const axios = require("axios")
 const logger = require("./logger")
@@ -10,7 +11,10 @@ const { STREAM_TYPES, resolveSelection } = require("./filters")
 
 const config = loadAndValidateYAML()
 const app = express()
-app.use(express.json())
+app.disable("x-powered-by")
+// The Tautulli payload is ~100 bytes. Refuse anything large, and refuse compressed bodies
+// outright rather than inflating caller-supplied data.
+app.use(express.json({ limit: "10kb", inflate: false }))
 
 app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok" })
@@ -23,6 +27,7 @@ const timestampsFile = process.argv[4] || "./last_run_timestamps.json"
 // Pacing knobs. The defaults are deliberately gentle on Plex; the overrides exist for tests.
 const STEP_DELAY_MS = Number(process.env.DEFAULTERR_STEP_DELAY_MS ?? 100)
 const RETRY_DELAY_MS = Number(process.env.DEFAULTERR_RETRY_DELAY_MS ?? 30000)
+const MAX_QUEUE = Number(process.env.DEFAULTERR_MAX_QUEUE ?? 100)
 const PLEX_TV_URL = (process.env.DEFAULTERR_PLEX_TV_URL || "https://plex.tv").replace(/\/$/, "")
 
 // Create an Axios instance with increased timeout and keep-alive
@@ -143,9 +148,21 @@ const setupCronJob = () => {
     if (config.dry_run || !config.partial_run_cron_expression) return
     if (!cronValidator.isValidCron(config.partial_run_cron_expression))
         throw new Error(`Invalid cron expression: ${config.partial_run_cron_expression}`)
+    let running = false
     cron.schedule(config.partial_run_cron_expression, async () => {
-        logger.info(`Running scheduled partial run at ${new Date().toISOString()}`)
-        await performPartialRun()
+        if (running) {
+            logger.warn("Previous scheduled run is still in progress. Skipping this one.")
+            return
+        }
+        running = true
+        try {
+            logger.info(`Running scheduled partial run at ${new Date().toISOString()}`)
+            await performPartialRun()
+        } catch (error) {
+            logger.error(`Scheduled run failed: ${error.message}`)
+        } finally {
+            running = false
+        }
     })
     logger.info("Cron job set up successfully")
 }
@@ -439,6 +456,16 @@ const applyUpdates = async (updatesByGroup, usersWithAccess) => {
     }
 }
 
+// All writes for one part happen under this lock, so a scheduled run and a webhook that reach
+// the same item can never interleave their per-group passes (group order is significant).
+// It is held per part, not per run, so a webhook waits for at most one item of a long run.
+let itemLock = Promise.resolve()
+const withItemLock = (fn) => {
+    const run = itemLock.then(fn, fn)
+    itemLock = run.catch(() => {})
+    return run
+}
+
 // Evaluate every group's filters against each part and apply the result.
 // With usersWithAccess === null this only evaluates and logs (the startup dry run).
 const processParts = async (parts, libraryName, usersWithAccess) => {
@@ -450,7 +477,7 @@ const processParts = async (parts, libraryName, usersWithAccess) => {
             if (matchedStreams.length > 0) updatesByGroup[group] = matchedStreams
         }
         if (usersWithAccess && Object.keys(updatesByGroup).length > 0) {
-            await applyUpdates(updatesByGroup, usersWithAccess)
+            await withItemLock(() => applyUpdates(updatesByGroup, usersWithAccess))
         }
         await delay(STEP_DELAY_MS)
     }
@@ -529,45 +556,77 @@ const performPartialRun = async (cleanRun) => {
     logger.info(`FINISHED ${cleanRun ? "CLEAN" : "PARTIAL"} RUN`)
 }
 
-// Tautulli webhook for new items
-app.post("/webhook", async (req, res) => {
-    try {
-        logger.info("Tautulli webhook received. Processing...")
+const WEBHOOK_TYPES = new Set(["movie", "show", "season", "episode"])
+// Plex ids are short decimal strings. Anything else is rejected before it can be interpolated
+// into a request path or written to the log.
+const isPlexId = (value) => (typeof value === "string" || typeof value === "number") && /^\d{1,12}$/.test(String(value))
 
-        const { type, libraryId, mediaId } = req.body
-        if (!type || !libraryId || !mediaId) throw new Error("Error getting request body")
+// Constant-time comparison. Both sides are hashed first so their lengths cannot leak either.
+const secretMatches = (provided) => {
+    const digest = (value) => crypto.createHash("sha256").update(String(value)).digest()
+    return crypto.timingSafeEqual(digest(config.webhook_secret), digest(typeof provided === "string" ? provided : ""))
+}
 
-        let libraryName = LIBRARIES.get(libraryId)?.name
+const handleWebhook = async (type, libraryId, mediaId) => {
+    logger.info(`Tautulli webhook received for ${type} ${mediaId}. Processing...`)
+
+    let libraryName = LIBRARIES.get(libraryId)?.name
+    if (!libraryName) {
+        // This only triggers if something goes wrong in Tautulli/Plex. Quick refresh should fix it.
+        logger.info(`Library ID ${libraryId} not found in filters. Attempting library refresh...`)
+        await fetchAllLibraries()
+
+        libraryName = LIBRARIES.get(libraryId)?.name
         if (!libraryName) {
-            // This only triggers if something goes wrong in Tautulli/Plex. Quick refresh should fix it.
-            logger.info(`Library ID ${libraryId} not found in filters. Attempting library refresh...`)
-            await fetchAllLibraries()
-
-            libraryName = LIBRARIES.get(libraryId)?.name
-            if (!libraryName) {
-                logger.info(`Library ID ${libraryId} not found in filters. Ending request`)
-                return res.status(200).send("Event not relevant")
-            }
+            logger.info(`Library ID ${libraryId} not found in filters. Ending request`)
+            return
         }
-
-        const usersWithAccess = await fetchUsersWithAccess(libraryName)
-
-        let parts = []
-        if (type === "movie" || type === "episode") {
-            parts = [await fetchStreamsForItem(mediaId)]
-        } else if (type === "show") {
-            parts = await fetchStreamsForShow(mediaId)
-        } else if (type === "season") {
-            parts = await fetchStreamsForSeason(mediaId)
-        }
-        await processParts(parts, libraryName, usersWithAccess)
-
-        logger.info("Tautulli webhook finished")
-        return res.status(200).send("Webhook received and processed.")
-    } catch (error) {
-        logger.error(`Error processing webhook: ${error.message}`)
-        res.status(500).send("Error processing webhook")
     }
+
+    const usersWithAccess = await fetchUsersWithAccess(libraryName)
+
+    let parts = []
+    if (type === "movie" || type === "episode") {
+        parts = [await fetchStreamsForItem(mediaId)]
+    } else if (type === "show") {
+        parts = await fetchStreamsForShow(mediaId)
+    } else if (type === "season") {
+        parts = await fetchStreamsForSeason(mediaId)
+    }
+    await processParts(parts, libraryName, usersWithAccess)
+
+    logger.info("Tautulli webhook finished")
+}
+
+// Webhooks are acknowledged immediately and worked through one at a time, so a burst cannot
+// fan out into unbounded concurrent Plex traffic. Past MAX_QUEUE pending, new ones are refused.
+let webhookTail = Promise.resolve()
+let webhooksPending = 0
+
+// Tautulli webhook for new items
+app.post("/webhook", (req, res) => {
+    if (config.webhook_secret && !secretMatches(req.get("X-Defaulterr-Secret"))) {
+        logger.warn("Webhook rejected: missing or incorrect X-Defaulterr-Secret header")
+        return res.status(401).send("Unauthorized")
+    }
+
+    const { type, libraryId, mediaId } = req.body || {}
+    if (!WEBHOOK_TYPES.has(type) || !isPlexId(libraryId) || !isPlexId(mediaId)) {
+        logger.warn("Webhook rejected: payload must be { type, libraryId, mediaId } with numeric ids")
+        return res.status(400).send("Invalid payload")
+    }
+
+    if (webhooksPending >= MAX_QUEUE) {
+        logger.warn(`Webhook rejected: ${webhooksPending} already pending`)
+        return res.status(503).set("Retry-After", "60").send("Busy")
+    }
+
+    webhooksPending++
+    webhookTail = webhookTail
+        .then(() => handleWebhook(type, String(libraryId), String(mediaId)))
+        .catch((error) => logger.error(`Error processing webhook: ${error.message}`))
+        .finally(() => webhooksPending--)
+    return res.status(202).send("Queued")
 })
 
 // Handle uncaught exceptions and unhandled rejections

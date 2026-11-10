@@ -19,6 +19,8 @@ const schema = {
         partial_run_on_start: { type: "boolean" },
         partial_run_cron_expression: { type: "string" },
         clean_run_on_start: { type: "boolean" },
+        // Optional shared secret. When set, POST /webhook must send it as X-Defaulterr-Secret.
+        webhook_secret: { type: "string", minLength: 16 },
         managed_users: {
             type: "object",
             additionalProperties: { type: "string" },
