@@ -6,6 +6,7 @@ const cron = require("node-cron")
 const cronValidator = require("cron-validator")
 const xml2js = require("xml2js")
 const loadAndValidateYAML = require("./configBuilder")
+const { STREAM_TYPES, resolveSelection } = require("./filters")
 
 const config = loadAndValidateYAML()
 const app = express()
@@ -15,10 +16,14 @@ app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok" })
 })
 
-const STREAM_TYPES = { video: 1, audio: 2, subtitles: 3 }
 const LIBRARIES = new Map()
 const USERS = new Map()
 const timestampsFile = process.argv[4] || "./last_run_timestamps.json"
+
+// Pacing knobs. The defaults are deliberately gentle on Plex; the overrides exist for tests.
+const STEP_DELAY_MS = Number(process.env.DEFAULTERR_STEP_DELAY_MS ?? 100)
+const RETRY_DELAY_MS = Number(process.env.DEFAULTERR_RETRY_DELAY_MS ?? 30000)
+const PLEX_TV_URL = (process.env.DEFAULTERR_PLEX_TV_URL || "https://plex.tv").replace(/\/$/, "")
 
 // Create an Axios instance with increased timeout and keep-alive
 const axiosInstance = axios.create({
@@ -65,7 +70,7 @@ const fetchAllUsersListedInFilters = async () => {
     try {
         if (!config.plex_client_identifier) throw new Error("Client identifier not supplied in config")
         const response = await axios.get(
-            `https://plex.tv/api/servers/${config.plex_client_identifier}/shared_servers`,
+            `${PLEX_TV_URL}/api/servers/${config.plex_client_identifier}/shared_servers`,
             {
                 headers: {
                     "X-Plex-Token": config.plex_owner_token,
@@ -126,7 +131,7 @@ const fetchUsersWithAccess = async (libraryName) => {
                     `User ${username} of group ${group} can't access library ${libraryName}. They will be skipped during updates. ${error.message}`
                 )
             }
-            await delay(100)
+            await delay(STEP_DELAY_MS)
         }
         usersWithAccess.set(group, users)
     }
@@ -151,7 +156,7 @@ const fetchAllLibraries = async () => {
         const { data } = await axiosInstance.get("/library/sections").catch(async (error) => {
             logger.error(`Error fetching libraries: ${error.message}. Retrying in 30 sec...`)
             for (let attempt = 1; attempt <= 10; attempt++) {
-                await delay(30000)
+                await delay(RETRY_DELAY_MS)
                 try {
                     return await axiosInstance.get("/library/sections")
                 } catch (retryError) {
@@ -209,53 +214,6 @@ const fetchUpdatedMediaItems = async (libraryId, lastUpdatedAt) => {
     }
 }
 
-const evaluateStreams = (streams, filters) => {
-    for (const filter of Object.values(filters)) {
-        if (filter === "disabled") {
-            return { id: 0 }
-        }
-
-        const { include, exclude } = filter
-
-        const defaultStream = streams.find((stream) => {
-            // Check 'include' first
-            if (
-                include &&
-                Object.entries(include).some(([field, value]) => {
-                    const streamValue = stream[field]?.toString().toLowerCase()
-                    if (!streamValue) return true
-                    const valuesArray = Array.isArray(value) ? value : [value]
-                    return valuesArray.some((value) => !streamValue.includes(value.toString().toLowerCase()))
-                })
-            ) {
-                return false
-            }
-
-            // Check 'exclude'
-            if (
-                exclude &&
-                Object.entries(exclude).some(([field, value]) => {
-                    const streamValue = stream[field]?.toString().toLowerCase()
-                    if (!streamValue) return false
-                    const valuesArray = Array.isArray(value) ? value : [value]
-                    return valuesArray.some((value) => streamValue.includes(value.toString().toLowerCase()))
-                })
-            ) {
-                return false
-            }
-
-            return true
-        })
-
-        if (defaultStream)
-            return {
-                id: defaultStream.id,
-                extendedDisplayTitle: defaultStream.extendedDisplayTitle,
-                onMatch: filter.on_match || {},
-            }
-    }
-}
-
 // Fetch streams for a specific media item (movie or episode)
 const fetchStreamsForItem = async (itemId) => {
     try {
@@ -300,7 +258,7 @@ const fetchStreamsForSeason = async (seasonId) => {
             const stream = await fetchStreamsForItem(episode.ratingKey)
             streams.push(stream)
             // Optional: Delay between fetching each episode to reduce load
-            await delay(100)
+            await delay(STEP_DELAY_MS)
         }
         return streams
     } catch (error) {
@@ -324,7 +282,7 @@ const fetchStreamsForShow = async (showId) => {
             const seasonStreams = await fetchStreamsForSeason(season.ratingKey)
             streams.push(...seasonStreams)
             // Optional: Delay between fetching each season to reduce load
-            await delay(100) // 100ms delay
+            await delay(STEP_DELAY_MS)
         }
         return streams
     } catch (error) {
@@ -348,21 +306,6 @@ const fetchLibraryDetailsByName = async (libraryName) => {
     }
 }
 
-const findMatchingAudioStream = (part, audioFilters) => {
-    if (!audioFilters) return
-
-    const audioStreams = part.streams.filter((stream) => stream.streamType === STREAM_TYPES.audio)
-    return evaluateStreams(audioStreams, audioFilters)
-}
-
-const findMatchingSubtitleStream = (part, subtitleFilters) => {
-    if (!subtitleFilters) return
-    if (subtitleFilters === "disabled") return { id: 0 }
-
-    const subtitleStreams = part.streams.filter((stream) => stream.streamType === STREAM_TYPES.subtitles)
-    return evaluateStreams(subtitleStreams, subtitleFilters)
-}
-
 // Determine which streams should be updated based on filters
 const identifyStreamsToUpdate = async (parts, filters) => {
     try {
@@ -376,16 +319,7 @@ const identifyStreamsToUpdate = async (parts, filters) => {
 
             const partUpdate = { partId: part.partId, title: part.title }
 
-            let audio = findMatchingAudioStream(part, filters.audio) || {}
-            let subtitles = findMatchingSubtitleStream(part, filters.subtitles) || {}
-
-            if (audio?.onMatch?.subtitles) {
-                subtitles = findMatchingSubtitleStream(part, audio.onMatch.subtitles) || {}
-            }
-
-            if (subtitles?.onMatch?.audio) {
-                audio = findMatchingAudioStream(part, subtitles.onMatch.audio) || {}
-            }
+            const { audio, subtitles } = resolveSelection(part, filters)
 
             if (audio.id) {
                 partUpdate.audioStreamId = audio.id
@@ -451,7 +385,7 @@ const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
                                         : ""
                                 }: ${error.message}. Retrying in 30 sec...`
                             )
-                            await delay(30000)
+                            await delay(RETRY_DELAY_MS)
                             let responseStatus = ""
                             let attempt = 1
                             while (responseStatus !== 200 && attempt < 10) {
@@ -469,7 +403,7 @@ const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
                                     })
                                 if (responseStatus !== 200) {
                                     attempt++
-                                    await delay(30000)
+                                    await delay(RETRY_DELAY_MS)
                                 }
                             }
                             if (responseStatus !== 200) {
@@ -489,7 +423,7 @@ const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
                 } catch (error) {
                     handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
                 }
-                await delay(100) // 50ms delay
+                await delay(STEP_DELAY_MS)
             }
             logger.info(`Part ID ${stream.partId}: update complete for group ${group}`)
         }
@@ -521,7 +455,7 @@ const identifyStreamsForDryRun = async () => {
                         newStreams[group] = matchedStreams
                     }
                 }
-                await delay(100)
+                await delay(STEP_DELAY_MS)
             }
         } else if (type === "show") {
             for (const item of updatedItems) {
@@ -538,7 +472,7 @@ const identifyStreamsForDryRun = async () => {
                             newStreams[group] = matchedStreams
                         }
                     }
-                    await delay(100)
+                    await delay(STEP_DELAY_MS)
                 }
             }
         }
@@ -602,7 +536,7 @@ const performPartialRun = async (cleanRun) => {
                 }
 
                 // Optional: Delay between processing each item to reduce load
-                await delay(100) // 100ms delay
+                await delay(STEP_DELAY_MS)
             }
         } else if (type === "show") {
             for (const item of updatedItems) {
@@ -623,7 +557,7 @@ const performPartialRun = async (cleanRun) => {
                     }
 
                     // Optional: Delay between processing each stream to reduce load
-                    await delay(100) // 100ms delay
+                    await delay(STEP_DELAY_MS)
                 }
             }
         }
@@ -722,7 +656,7 @@ app.post("/webhook", async (req, res) => {
                     }
 
                     // Optional: Delay between posting each update to reduce load
-                    await delay(100) // 50ms delay
+                    await delay(STEP_DELAY_MS)
                 }
             }
         }
