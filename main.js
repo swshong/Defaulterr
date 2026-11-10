@@ -224,17 +224,40 @@ const saveLastRunTimestamps = (timestamps) => {
     fs.writeFileSync(timestampsFile, JSON.stringify(timestamps, null, 2), "utf-8")
 }
 
-// Fetch media items that were updated after a specific timestamp
-const fetchUpdatedMediaItems = async (libraryId, lastUpdatedAt) => {
-    try {
-        const { data } = await axiosInstance.get(`/library/sections/${libraryId}/all`)
-        const items = data?.MediaContainer?.Metadata || []
+const PAGE_SIZE = 500
 
-        // Filter items updated after the last known updatedAt timestamp
+// Fetch the playable items (movies, or episodes for a show library) updated after a timestamp.
+//
+// Episodes are requested directly (type=4) rather than by walking shows, because Plex does not
+// bump a show's updatedAt when one of its episodes is replaced or re-analysed. Comparing
+// show-level timestamps therefore misses rewritten episodes entirely. The updatedAt filter is
+// applied by the server and the result is paged, so a run no longer pulls the whole library.
+// Returns null if the library could not be read, so the caller can leave its watermark alone.
+const fetchUpdatedMediaItems = async (libraryId, libraryType, lastUpdatedAt) => {
+    try {
+        const params = { "updatedAt>>": lastUpdatedAt }
+        if (libraryType === "show") params.type = 4
+
+        const items = []
+        const seen = new Set()
+        for (let start = 0; ; start += PAGE_SIZE) {
+            const { data } = await axiosInstance.get(`/library/sections/${libraryId}/all`, {
+                params,
+                headers: { "X-Plex-Container-Start": start, "X-Plex-Container-Size": PAGE_SIZE },
+            })
+            const page = data?.MediaContainer?.Metadata || []
+            const fresh = page.filter((item) => !seen.has(item.ratingKey))
+            fresh.forEach((item) => seen.add(item.ratingKey))
+            items.push(...fresh)
+            // stop on a short page, or if the server ignored paging and sent the same rows again
+            if (page.length < PAGE_SIZE || fresh.length === 0) break
+        }
+
+        // The server already filtered; this guards against one that ignores the parameter
         return items.filter((item) => item.updatedAt > lastUpdatedAt)
     } catch (error) {
         handleAxiosError(`fetching updated media for Library ID ${libraryId}`, error)
-        return []
+        return null
     }
 }
 
@@ -499,11 +522,9 @@ const identifyStreamsForDryRun = async () => {
             logger.warn(`Library '${libraryName}' details are incomplete. Skipping.`)
             continue
         }
-        const updatedItems = await fetchUpdatedMediaItems(id, 0)
-        for (const item of updatedItems) {
-            logger.info(`Fetching streams for ${type} '${item.title}'`)
-            const parts = type === "movie" ? [await fetchStreamsForItem(item.ratingKey)] : await fetchStreamsForShow(item.ratingKey)
-            await processParts(parts, libraryName, null)
+        const items = (await fetchUpdatedMediaItems(id, type, 0)) || []
+        for (const item of items) {
+            await processParts([await fetchStreamsForItem(item.ratingKey)], libraryName, null)
         }
     }
 }
@@ -535,8 +556,12 @@ const performPartialRun = async (cleanRun) => {
         const lastUpdatedAt = lastRunTimestamps[libraryName] || 0
 
         // Fetch updated media items based on updatedAt timestamp
-        const updatedItems = await fetchUpdatedMediaItems(id, lastUpdatedAt)
-        if (!updatedItems || updatedItems.length === 0) {
+        const updatedItems = await fetchUpdatedMediaItems(id, type, lastUpdatedAt)
+        if (updatedItems === null) {
+            logger.warn(`Could not read library ${libraryName}. Leaving it for the next run`)
+            continue
+        }
+        if (updatedItems.length === 0) {
             logger.info(`No changes detected in library ${libraryName} since the last run`)
             continue
         }
@@ -547,13 +572,13 @@ const performPartialRun = async (cleanRun) => {
             continue
         }
 
+        logger.info(`${updatedItems.length} item(s) changed in library ${libraryName} since the last run`)
         for (const item of updatedItems) {
-            const parts = type === "movie" ? [await fetchStreamsForItem(item.ratingKey)] : await fetchStreamsForShow(item.ratingKey)
-            await processParts(parts, libraryName, usersWithAccess)
+            await processParts([await fetchStreamsForItem(item.ratingKey)], libraryName, usersWithAccess)
         }
 
         // Update the timestamp for the current library
-        const latestUpdatedAt = Math.max(...updatedItems.map((item) => item.updatedAt))
+        const latestUpdatedAt = updatedItems.reduce((latest, item) => Math.max(latest, item.updatedAt), lastUpdatedAt)
         newTimestamps[libraryName] = latestUpdatedAt
     }
 
