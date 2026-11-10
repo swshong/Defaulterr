@@ -7,6 +7,72 @@ to [`ghcr.io/swshong/defaulterr`](https://github.com/swshong/Defaulterr/pkgs/con
 All notable changes to this fork (relative to upstream) are documented here.
 Upstream history prior to the fork lives in the [original project](https://github.com/varthe/Defaulterr).
 
+## 2026-11-10
+
+### Reviewed & patched by Claude Fable 5.2
+
+Four-pass review (security, dependencies and supply chain, reliability, enhancements) by
+**Claude Fable 5.2** (Anthropic) on 2026-11-10. Every fix below has a test that fails on the
+previous release and passes on this one; the suite (31 tests, `npm test`) runs the real
+application against a fake Plex and now gates image publishing.
+
+### Fixed
+
+- **Scheduled runs never saw changed episodes.** Plex does not update a show's `updatedAt` when
+  one of its episodes is replaced, and partial runs compared show-level timestamps. Rewritten
+  episodes kept whatever tracks Plex re-selected. Measured on a live server: 722 changed episodes
+  had gone unnoticed, 21 of them with a wrong audio or subtitle track for the owner, against 0 of
+  592 in an untouched control sample. Runs now request changed episodes directly, with the filter
+  applied by the server and the result paged.
+- **A permanent failure ended in `process.exit`.** The scheduled-run path retried every failed
+  write, including 403 and 404, nine times and then exited, which with a restart policy is a
+  restart loop on the same item. Writes now go through one function: network errors, 429 and 5xx
+  are retried with backoff, other 4xx are logged once and skipped, and nothing exits.
+- A retry that succeeded was logged as an error (`Cannot read properties of undefined`).
+- `dry_run` did not stop webhook-triggered writes.
+- One library missing from Plex silently left every library listed after it unmapped.
+- A filter naming a group not defined under `groups` threw in the middle of a run; it is now a
+  startup error. `on_match.audio: disabled`, which validated but selected the first audio track,
+  is rejected with an explanation.
+- The user list was read once at startup, so users added later got no defaults until a restart.
+  It is refreshed every 15 minutes and survives plex.tv being unreachable.
+- A webhook and a scheduled run could interleave their per-group passes on the same item;
+  overlapping scheduled runs could run concurrently.
+- The timestamps file was parsed without a guard and written in place.
+- No SIGTERM handler: every `docker stop` waited 10 seconds and ended in SIGKILL.
+
+### Security
+
+- **Webhook input is validated.** `mediaId` and `libraryId` were taken from an unauthenticated
+  request and interpolated into requests made with the owner token. Both must now be numeric and
+  `type` must be a known value; anything else is refused before any outbound request.
+- **Optional `webhook_secret`.** When set, `POST /webhook` requires it in an
+  `X-Defaulterr-Secret` header, compared in constant time.
+- Webhook bodies are capped at 10 kb, compressed bodies are refused, and requests are queued
+  (bounded) and answered with `202` instead of each starting work immediately.
+- **Plex tokens no longer follow redirects.** `X-Plex-Token` is a custom header and was carried to
+  the target of a cross-host redirect. Redirects are now refused on every outbound call.
+- Every outbound request has a timeout.
+- Control characters in logged values (for example a title containing a newline) can no longer
+  forge log lines.
+- `body-parser` (high, reachable through the webhook), `follow-redirects` (high) and `fast-uri`
+  (moderate) advisories cleared. `npm audit`: **0 known vulnerabilities**.
+
+### Changed
+
+- A successful webhook returns `202 Queued` immediately rather than `200` when the work is done.
+- Per-user `SUCCESS` log lines move to debug. Each part and group now logs one info line:
+  `Part ID 212531: group english updated for 25/25 users`.
+- The first run after upgrading processes the backlog of episodes changed since each show
+  library's last watermark.
+
+### Build & CI
+
+- New `test` job (lint, tests, `npm audit` at high) that gates publishing and runs on pull requests.
+- Weekly scheduled rebuild, and Dependabot for npm, the base image and the actions.
+- `cron-validator` removed in favour of `node-cron`'s own `validate()`.
+- The image no longer ships tests, the Unraid template or the lint config.
+
 ## 2026-10-16
 
 ### Reviewed & patched by Claude Opus 5
@@ -204,4 +270,4 @@ The fork's divergence from upstream, as it stands at this review, is catalogued 
 
 ---
 
-_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06), Claude Fable 5 (2026-07-10), and Claude Opus 5 (2026-08-05, 2026-08-20, 2026-10-16)._
+_Reviewed and documented with assistance from Claude Opus 4.8 (2026-06-06), Claude Fable 5 (2026-07-10), Claude Opus 5 (2026-08-05, 2026-08-20, 2026-10-16), and Claude Fable 5.2 (2026-11-10)._

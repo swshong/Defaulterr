@@ -11,8 +11,12 @@ Dockerfile
 *.md
 example.json
 docker-compose.yaml
-eslint.config.mjs
+eslint.config.js
 .vscode/
 .idea/
 *.iml
 .prettierrc
+test/
+defaulterr.xml
+*.yaml
+*.yml

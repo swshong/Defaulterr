@@ -5,6 +5,10 @@ plex_owner_token: ""
 plex_client_identifier: "" # See README on how to obtain
 # REQUIRED END
 
+# OPTIONAL: shared secret for the Tautulli webhook (16+ characters). When set, Tautulli must
+# send it as an X-Defaulterr-Secret header. See README.
+# webhook_secret: ""
+
 # RUN SETTINGS
 dry_run: True # For testing filters; won't update users. Recommended to test a few times to ensure filters work.
 

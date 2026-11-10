@@ -1,24 +1,34 @@
 const express = require("express")
+const crypto = require("crypto")
 const fs = require("fs")
 const axios = require("axios")
 const logger = require("./logger")
 const cron = require("node-cron")
-const cronValidator = require("cron-validator")
 const xml2js = require("xml2js")
 const loadAndValidateYAML = require("./configBuilder")
+const { STREAM_TYPES, resolveSelection } = require("./filters")
 
 const config = loadAndValidateYAML()
 const app = express()
-app.use(express.json())
+app.disable("x-powered-by")
+// The Tautulli payload is ~100 bytes. Refuse anything large, and refuse compressed bodies
+// outright rather than inflating caller-supplied data.
+app.use(express.json({ limit: "10kb", inflate: false }))
 
 app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok" })
 })
 
-const STREAM_TYPES = { video: 1, audio: 2, subtitles: 3 }
 const LIBRARIES = new Map()
 const USERS = new Map()
 const timestampsFile = process.argv[4] || "./last_run_timestamps.json"
+
+// Pacing knobs. The defaults are deliberately gentle on Plex; the overrides exist for tests.
+const STEP_DELAY_MS = Number(process.env.DEFAULTERR_STEP_DELAY_MS ?? 100)
+const RETRY_DELAY_MS = Number(process.env.DEFAULTERR_RETRY_DELAY_MS ?? 30000)
+const USER_REFRESH_MS = Number(process.env.DEFAULTERR_USER_REFRESH_MS ?? 15 * 60 * 1000)
+const MAX_QUEUE = Number(process.env.DEFAULTERR_MAX_QUEUE ?? 100)
+const PLEX_TV_URL = (process.env.DEFAULTERR_PLEX_TV_URL || "https://plex.tv").replace(/\/$/, "")
 
 // Create an Axios instance with increased timeout and keep-alive
 const axiosInstance = axios.create({
@@ -26,7 +36,11 @@ const axiosInstance = axios.create({
     headers: {
         "X-Plex-Token": config.plex_owner_token,
     },
-    timeout: 600000,
+    timeout: 120000,
+    // Plex never redirects API calls. Refusing redirects means the X-Plex-Token header
+    // (which, unlike Authorization, is not stripped on a cross-host redirect) cannot be
+    // carried to another host.
+    maxRedirects: 0,
 })
 
 // Utility to handle error logging
@@ -60,42 +74,55 @@ const getUserDetailsFromXml = async (xml) => {
     }
 }
 
-// Fetch all users listed in filters
-const fetchAllUsersListedInFilters = async () => {
-    try {
-        if (!config.plex_client_identifier) throw new Error("Client identifier not supplied in config")
-        const response = await axios.get(
-            `https://plex.tv/api/servers/${config.plex_client_identifier}/shared_servers`,
-            {
-                headers: {
-                    "X-Plex-Token": config.plex_owner_token,
-                    Accept: "application/json",
-                },
-            }
-        )
-        const filterUsernames = new Set(Object.values(config.groups).flat())
-        const users = await getUserDetailsFromXml(response.data)
-        users.forEach((user) => {
-            if (filterUsernames.has(user.username) || filterUsernames.has("$ALL")) {
-                USERS.set(user.username, user.accessToken)
-            }
-        })
-        logger.info("Fetched and stored user details successfully.")
-    } catch (error) {
-        logger.warn(`Could not fetch users with access to server: ${error.message}`)
+// Users shared on the server, as last reported by plex.tv
+let sharedUsers = new Map()
+let usersFetchedAt = 0
+// `${libraryId}:${username}` -> { ok, at }
+const accessCache = new Map()
+
+// Rebuild USERS from the owner, plex.tv's shared-user list and managed_users.
+// Called before every run and webhook, and refreshed from plex.tv at most every
+// USER_REFRESH_MS, so people added to (or removed from) the server are picked up without a
+// restart. If plex.tv cannot be reached the last known shared users are kept.
+const refreshUsers = async ({ force = false } = {}) => {
+    if (force || Date.now() - usersFetchedAt >= USER_REFRESH_MS) {
+        try {
+            const response = await axios.get(
+                `${PLEX_TV_URL}/api/servers/${encodeURIComponent(config.plex_client_identifier)}/shared_servers`,
+                {
+                    headers: {
+                        "X-Plex-Token": config.plex_owner_token,
+                        Accept: "application/json",
+                    },
+                    timeout: 30000,
+                    maxRedirects: 0,
+                }
+            )
+            const filterUsernames = new Set(Object.values(config.groups).flat())
+            const users = await getUserDetailsFromXml(response.data)
+            sharedUsers = new Map(
+                users
+                    .filter((user) => filterUsernames.has(user.username) || filterUsernames.has("$ALL"))
+                    .map((user) => [user.username, user.accessToken])
+            )
+            const firstFetch = usersFetchedAt === 0
+            usersFetchedAt = Date.now()
+            accessCache.clear()
+            logger[firstFetch ? "info" : "debug"]("Fetched and stored user details successfully.")
+        } catch (error) {
+            logger.warn(
+                `Could not fetch users with access to server: ${error.message}. Keeping the ${sharedUsers.size} already known.`
+            )
+        }
     }
 
-    // Managed user tokens come from the config, not plex.tv — register them even if the fetch above failed
-    const managedUsers = config.managed_users
-    if (managedUsers) {
-        Object.keys(managedUsers).forEach((user) => {
-            const token = managedUsers[user]
-            if (user && token) {
-                USERS.set(user, token)
-            }
-        })
-        logger.info(`Finished processing managed users`)
-    }
+    USERS.clear()
+    if (config.plex_owner_name) USERS.set(config.plex_owner_name, config.plex_owner_token)
+    sharedUsers.forEach((token, username) => USERS.set(username, token))
+    // Managed user tokens come from the config, not plex.tv, and take precedence
+    Object.entries(config.managed_users || {}).forEach(([user, token]) => {
+        if (user && token) USERS.set(user, token)
+    })
 }
 
 // Verify each token can access the API endpoint
@@ -111,22 +138,33 @@ const fetchUsersWithAccess = async (libraryName) => {
             usernames = [...USERS.keys()]
         }
         for (const username of usernames) {
-            const token = USERS.get(username)
+            // The same user is usually in several groups; ask Plex once and remember the answer
+            const cacheKey = `${id}:${username}`
+            const cached = accessCache.get(cacheKey)
+            if (cached && Date.now() - cached.at < USER_REFRESH_MS) {
+                if (cached.ok) users.push(username)
+                continue
+            }
             try {
-                const response = await axios.get(`${config.plex_server_url}/library/sections/${id}`, {
-                    headers: { "X-Plex-Token": token },
+                await axiosInstance.get(`/library/sections/${id}`, {
+                    headers: { "X-Plex-Token": USERS.get(username) },
+                    timeout: 30000,
                 })
-                if (response.status !== 200) throw new Error(`Unexpected response status: ${response.status}`)
                 logger.debug(
                     `Checking if user ${username} of group ${group} has access to library ${libraryName}... OK`
                 )
+                accessCache.set(cacheKey, { ok: true, at: Date.now() })
                 users.push(username)
             } catch (error) {
                 logger.warn(
                     `User ${username} of group ${group} can't access library ${libraryName}. They will be skipped during updates. ${error.message}`
                 )
+                // Remember a definite "no", but not a network error or a Plex hiccup
+                if ([401, 403, 404].includes(error.response?.status)) {
+                    accessCache.set(cacheKey, { ok: false, at: Date.now() })
+                }
             }
-            await delay(100)
+            await delay(STEP_DELAY_MS)
         }
         usersWithAccess.set(group, users)
     }
@@ -136,11 +174,23 @@ const fetchUsersWithAccess = async (libraryName) => {
 // Setup Cron Job
 const setupCronJob = () => {
     if (config.dry_run || !config.partial_run_cron_expression) return
-    if (!cronValidator.isValidCron(config.partial_run_cron_expression))
+    if (!cron.validate(config.partial_run_cron_expression))
         throw new Error(`Invalid cron expression: ${config.partial_run_cron_expression}`)
+    let running = false
     cron.schedule(config.partial_run_cron_expression, async () => {
-        logger.info(`Running scheduled partial run at ${new Date().toISOString()}`)
-        await performPartialRun()
+        if (running) {
+            logger.warn("Previous scheduled run is still in progress. Skipping this one.")
+            return
+        }
+        running = true
+        try {
+            logger.info(`Running scheduled partial run at ${new Date().toISOString()}`)
+            await performPartialRun()
+        } catch (error) {
+            logger.error(`Scheduled run failed: ${error.message}`)
+        } finally {
+            running = false
+        }
     })
     logger.info("Cron job set up successfully")
 }
@@ -151,7 +201,7 @@ const fetchAllLibraries = async () => {
         const { data } = await axiosInstance.get("/library/sections").catch(async (error) => {
             logger.error(`Error fetching libraries: ${error.message}. Retrying in 30 sec...`)
             for (let attempt = 1; attempt <= 10; attempt++) {
-                await delay(30000)
+                await delay(RETRY_DELAY_MS)
                 try {
                     return await axiosInstance.get("/library/sections")
                 } catch (retryError) {
@@ -165,15 +215,23 @@ const fetchAllLibraries = async () => {
         })
         const libraries = data?.MediaContainer?.Directory || []
 
+        // Build the new map fully before swapping it in, and never let one bad entry stop the rest
+        const mapped = new Map()
         for (const libraryName in config.filters) {
             const library = libraries.find((lib) => lib.title.toLowerCase() === libraryName.toLowerCase())
-            if (!library) throw new Error(`Library '${libraryName}' not found in Plex response`)
-            if (library.type !== "movie" && library.type !== "show")
-                throw new Error(`Invalid library type '${library.type}'. Must be 'movie' or 'show'`)
-
-            LIBRARIES.set(library.key, { name: library.title, type: library.type })
+            if (!library) {
+                logger.error(`Library '${libraryName}' not found in Plex. Check its name under 'filters'. Skipping it.`)
+                continue
+            }
+            if (library.type !== "movie" && library.type !== "show") {
+                logger.error(`Library '${libraryName}' has type '${library.type}'. Only 'movie' and 'show' are supported. Skipping it.`)
+                continue
+            }
+            mapped.set(library.key, { name: library.title, type: library.type })
             logger.debug(`Mapped library: ${library.title} (ID: ${library.key}, Type: ${library.type})`)
         }
+        LIBRARIES.clear()
+        mapped.forEach((details, key) => LIBRARIES.set(key, details))
 
         logger.info("Fetched and mapped libraries")
     } catch (error) {
@@ -183,76 +241,61 @@ const fetchAllLibraries = async () => {
 
 // Load last run timestamps from the file
 const loadLastRunTimestamps = () => {
-    if (fs.existsSync(timestampsFile)) {
-        const data = fs.readFileSync(timestampsFile, "utf-8")
-        return JSON.parse(data)
-    }
-    return {}
-}
-
-// Save the new last run timestamps to the file
-const saveLastRunTimestamps = (timestamps) => {
-    fs.writeFileSync(timestampsFile, JSON.stringify(timestamps, null, 2), "utf-8")
-}
-
-// Fetch media items that were updated after a specific timestamp
-const fetchUpdatedMediaItems = async (libraryId, lastUpdatedAt) => {
+    if (!fs.existsSync(timestampsFile)) return {}
     try {
-        const { data } = await axiosInstance.get(`/library/sections/${libraryId}/all`)
-        const items = data?.MediaContainer?.Metadata || []
+        const parsed = JSON.parse(fs.readFileSync(timestampsFile, "utf-8"))
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a JSON object")
+        return parsed
+    } catch (error) {
+        logger.warn(
+            `Timestamps file ${timestampsFile} is unreadable (${error.message}). Treating every library as never processed.`
+        )
+        return {}
+    }
+}
 
-        // Filter items updated after the last known updatedAt timestamp
+// Save the new last run timestamps to the file. Written to a temp file and renamed into
+// place, so a crash or full disk mid-write cannot leave a truncated file behind.
+const saveLastRunTimestamps = (timestamps) => {
+    const tempFile = `${timestampsFile}.tmp`
+    fs.writeFileSync(tempFile, JSON.stringify(timestamps, null, 2), "utf-8")
+    fs.renameSync(tempFile, timestampsFile)
+}
+
+const PAGE_SIZE = 500
+
+// Fetch the playable items (movies, or episodes for a show library) updated after a timestamp.
+//
+// Episodes are requested directly (type=4) rather than by walking shows, because Plex does not
+// bump a show's updatedAt when one of its episodes is replaced or re-analysed. Comparing
+// show-level timestamps therefore misses rewritten episodes entirely. The updatedAt filter is
+// applied by the server and the result is paged, so a run no longer pulls the whole library.
+// Returns null if the library could not be read, so the caller can leave its watermark alone.
+const fetchUpdatedMediaItems = async (libraryId, libraryType, lastUpdatedAt) => {
+    try {
+        const params = { "updatedAt>>": lastUpdatedAt }
+        if (libraryType === "show") params.type = 4
+
+        const items = []
+        const seen = new Set()
+        for (let start = 0; ; start += PAGE_SIZE) {
+            const { data } = await axiosInstance.get(`/library/sections/${libraryId}/all`, {
+                params,
+                headers: { "X-Plex-Container-Start": start, "X-Plex-Container-Size": PAGE_SIZE },
+            })
+            const page = data?.MediaContainer?.Metadata || []
+            const fresh = page.filter((item) => !seen.has(item.ratingKey))
+            fresh.forEach((item) => seen.add(item.ratingKey))
+            items.push(...fresh)
+            // stop on a short page, or if the server ignored paging and sent the same rows again
+            if (page.length < PAGE_SIZE || fresh.length === 0) break
+        }
+
+        // The server already filtered; this guards against one that ignores the parameter
         return items.filter((item) => item.updatedAt > lastUpdatedAt)
     } catch (error) {
         handleAxiosError(`fetching updated media for Library ID ${libraryId}`, error)
-        return []
-    }
-}
-
-const evaluateStreams = (streams, filters) => {
-    for (const filter of Object.values(filters)) {
-        if (filter === "disabled") {
-            return { id: 0 }
-        }
-
-        const { include, exclude } = filter
-
-        const defaultStream = streams.find((stream) => {
-            // Check 'include' first
-            if (
-                include &&
-                Object.entries(include).some(([field, value]) => {
-                    const streamValue = stream[field]?.toString().toLowerCase()
-                    if (!streamValue) return true
-                    const valuesArray = Array.isArray(value) ? value : [value]
-                    return valuesArray.some((value) => !streamValue.includes(value.toString().toLowerCase()))
-                })
-            ) {
-                return false
-            }
-
-            // Check 'exclude'
-            if (
-                exclude &&
-                Object.entries(exclude).some(([field, value]) => {
-                    const streamValue = stream[field]?.toString().toLowerCase()
-                    if (!streamValue) return false
-                    const valuesArray = Array.isArray(value) ? value : [value]
-                    return valuesArray.some((value) => streamValue.includes(value.toString().toLowerCase()))
-                })
-            ) {
-                return false
-            }
-
-            return true
-        })
-
-        if (defaultStream)
-            return {
-                id: defaultStream.id,
-                extendedDisplayTitle: defaultStream.extendedDisplayTitle,
-                onMatch: filter.on_match || {},
-            }
+        return null
     }
 }
 
@@ -300,7 +343,7 @@ const fetchStreamsForSeason = async (seasonId) => {
             const stream = await fetchStreamsForItem(episode.ratingKey)
             streams.push(stream)
             // Optional: Delay between fetching each episode to reduce load
-            await delay(100)
+            await delay(STEP_DELAY_MS)
         }
         return streams
     } catch (error) {
@@ -324,7 +367,7 @@ const fetchStreamsForShow = async (showId) => {
             const seasonStreams = await fetchStreamsForSeason(season.ratingKey)
             streams.push(...seasonStreams)
             // Optional: Delay between fetching each season to reduce load
-            await delay(100) // 100ms delay
+            await delay(STEP_DELAY_MS)
         }
         return streams
     } catch (error) {
@@ -348,21 +391,6 @@ const fetchLibraryDetailsByName = async (libraryName) => {
     }
 }
 
-const findMatchingAudioStream = (part, audioFilters) => {
-    if (!audioFilters) return
-
-    const audioStreams = part.streams.filter((stream) => stream.streamType === STREAM_TYPES.audio)
-    return evaluateStreams(audioStreams, audioFilters)
-}
-
-const findMatchingSubtitleStream = (part, subtitleFilters) => {
-    if (!subtitleFilters) return
-    if (subtitleFilters === "disabled") return { id: 0 }
-
-    const subtitleStreams = part.streams.filter((stream) => stream.streamType === STREAM_TYPES.subtitles)
-    return evaluateStreams(subtitleStreams, subtitleFilters)
-}
-
 // Determine which streams should be updated based on filters
 const identifyStreamsToUpdate = async (parts, filters) => {
     try {
@@ -376,16 +404,7 @@ const identifyStreamsToUpdate = async (parts, filters) => {
 
             const partUpdate = { partId: part.partId, title: part.title }
 
-            let audio = findMatchingAudioStream(part, filters.audio) || {}
-            let subtitles = findMatchingSubtitleStream(part, filters.subtitles) || {}
-
-            if (audio?.onMatch?.subtitles) {
-                subtitles = findMatchingSubtitleStream(part, audio.onMatch.subtitles) || {}
-            }
-
-            if (subtitles?.onMatch?.audio) {
-                audio = findMatchingAudioStream(part, subtitles.onMatch.audio) || {}
-            }
+            const { audio, subtitles } = resolveSelection(part, filters)
 
             if (audio.id) {
                 partUpdate.audioStreamId = audio.id
@@ -417,82 +436,118 @@ const identifyStreamsToUpdate = async (parts, filters) => {
     }
 }
 
-// Update default streams for a single item across all relevant users
-const updateDefaultStreamsPerItem = async (streamsToUpdate, filters, users) => {
-    for (const group in streamsToUpdate) {
-        for (const stream of streamsToUpdate[group]) {
-            const usernames = users.get(group)
-            if (usernames.length === 0) {
-                logger.warn(`No users found in group '${group}'. Skipping update.`)
-                continue
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
+const MAX_UPDATE_ATTEMPTS = 4
+
+// Honour a Retry-After header given in seconds, capped so a bad value cannot stall a run
+const retryAfterMs = (error) => {
+    const seconds = Number(error.response?.headers?.["retry-after"])
+    return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 300) * 1000 : undefined
+}
+
+// Set the default streams on one part for one user. Resolves true on success, false otherwise.
+// Network errors, 429 and 5xx are retried with backoff. Any other 4xx is permanent for this
+// user and part (no access, age rating, item replaced under us), so it is reported once and
+// skipped rather than retried. Nothing in here ends the process.
+const postStreamUpdate = async (stream, username, group, token) => {
+    const queryParams = new URLSearchParams()
+    if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
+    if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
+    const what = [
+        stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : "",
+        stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : "",
+    ]
+        .filter(Boolean)
+        .join(" and ")
+    const target = `part ${stream.partId} for user ${username} in group ${group}`
+
+    if (config.dry_run) {
+        logger.info(`DRY RUN: would set ${what} on ${target}`)
+        return true
+    }
+
+    for (let attempt = 1; attempt <= MAX_UPDATE_ATTEMPTS; attempt++) {
+        try {
+            await axiosInstance.post(
+                `/library/parts/${stream.partId}?${queryParams.toString()}`,
+                {},
+                { headers: { "X-Plex-Token": token } }
+            )
+            logger.debug(`Update ${what} on ${target}: SUCCESS`)
+            return true
+        } catch (error) {
+            const status = error.response?.status
+            const reason = status ? `HTTP ${status}` : error.message
+            const retryable = !error.response || RETRYABLE_STATUS.has(status)
+            if (!retryable || attempt === MAX_UPDATE_ATTEMPTS) {
+                logger.warn(
+                    `Update ${what} on ${target}: FAILED (${reason})${
+                        status === 403
+                            ? ". This could be because of age ratings, ensure they can access ALL items in the library"
+                            : ""
+                    }`
+                )
+                return false
             }
+            const wait = retryAfterMs(error) ?? RETRY_DELAY_MS * attempt
+            logger.warn(
+                `Update on ${target} failed (${reason}). Retry ${attempt}/${MAX_UPDATE_ATTEMPTS - 1} in ${Math.round(wait / 1000)}s`
+            )
+            await delay(wait)
+        }
+    }
+    return false
+}
+
+// Apply one part's updates. Groups are applied in config order, so a group listed later
+// deliberately overrides an earlier one for users who are in both.
+const applyUpdates = async (updatesByGroup, usersWithAccess) => {
+    for (const [group, streams] of Object.entries(updatesByGroup)) {
+        const usernames = usersWithAccess.get(group) || []
+        if (usernames.length === 0) {
+            logger.warn(`No users found in group '${group}'. Skipping update.`)
+            continue
+        }
+        for (const stream of streams) {
+            let succeeded = 0
             for (const username of usernames) {
                 const token = USERS.get(username)
                 if (!token) {
                     logger.warn(`No access token found for user ${username}. Skipping update.`)
                     continue
                 }
-                const queryParams = new URLSearchParams()
-                if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
-                if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
-
-                try {
-                    const response = await axiosInstance
-                        .post(
-                            `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                            {},
-                            { headers: { "X-Plex-Token": token } }
-                        )
-                        .catch(async (error) => {
-                            logger.error(
-                                `Error while posting update for user ${username} in group ${group}${
-                                    error.status === 403
-                                        ? ". This could be because of age ratings, ensure they can access ALL items in the library"
-                                        : ""
-                                }: ${error.message}. Retrying in 30 sec...`
-                            )
-                            await delay(30000)
-                            let responseStatus = ""
-                            let attempt = 1
-                            while (responseStatus !== 200 && attempt < 10) {
-                                await axiosInstance
-                                    .post(
-                                        `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                                        {},
-                                        { headers: { "X-Plex-Token": token } }
-                                    )
-                                    .then((response) => (responseStatus = response.status))
-                                    .catch((error) => {
-                                        logger.error(
-                                            `Attempt ${attempt}/10 failed with error: ${error.message}. Retrying in 30 sec...`
-                                        )
-                                    })
-                                if (responseStatus !== 200) {
-                                    attempt++
-                                    await delay(30000)
-                                }
-                            }
-                            if (responseStatus !== 200) {
-                                logger.error("All attemps failed. Exiting application.")
-                                process.exit(1)
-                            }
-                        })
-
-                    const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
-                    const subtitleMessage = stream.subtitleStreamId >= 0 ? `Subtitle ID ${stream.subtitleStreamId}` : ""
-                    const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
-                    logger.debug(
-                        `Update ${updateMessage} for user ${username} in group ${group}: ${
-                            response.status === 200 ? "SUCCESS" : "FAIL"
-                        }`
-                    )
-                } catch (error) {
-                    handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
-                }
-                await delay(100) // 50ms delay
+                if (await postStreamUpdate(stream, username, group, token)) succeeded++
+                await delay(STEP_DELAY_MS)
             }
-            logger.info(`Part ID ${stream.partId}: update complete for group ${group}`)
+            logger.info(`Part ID ${stream.partId}: group ${group} updated for ${succeeded}/${usernames.length} users`)
         }
+    }
+}
+
+// All writes for one part happen under this lock, so a scheduled run and a webhook that reach
+// the same item can never interleave their per-group passes (group order is significant).
+// It is held per part, not per run, so a webhook waits for at most one item of a long run.
+let itemLock = Promise.resolve()
+const withItemLock = (fn) => {
+    const run = itemLock.then(fn, fn)
+    itemLock = run.catch(() => {})
+    return run
+}
+
+// Evaluate every group's filters against each part and apply the result.
+// With usersWithAccess === null this only evaluates and logs (the startup dry run).
+const processParts = async (parts, libraryName, usersWithAccess) => {
+    const groupFilters = config.filters[libraryName]
+    for (const part of parts) {
+        const updatesByGroup = {}
+        for (const group in groupFilters) {
+            const matchedStreams = await identifyStreamsToUpdate([part], groupFilters[group])
+            if (matchedStreams.length > 0) updatesByGroup[group] = matchedStreams
+        }
+        if (usersWithAccess && Object.keys(updatesByGroup).length > 0) {
+            await withItemLock(() => applyUpdates(updatesByGroup, usersWithAccess))
+        }
+        await delay(STEP_DELAY_MS)
     }
 }
 
@@ -505,42 +560,9 @@ const identifyStreamsForDryRun = async () => {
             logger.warn(`Library '${libraryName}' details are incomplete. Skipping.`)
             continue
         }
-        const updatedItems = await fetchUpdatedMediaItems(id, 0)
-
-        if (type === "movie") {
-            for (const item of updatedItems) {
-                const { title, ratingKey } = item;
-                logger.info(`Fetching streams for ${type} '${title}'`)
-                const stream = await fetchStreamsForItem(ratingKey)
-                const groupFilters = config.filters[libraryName]
-                const newStreams = {}
-
-                for (const group in groupFilters) {
-                    const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                    if (matchedStreams.length > 0) {
-                        newStreams[group] = matchedStreams
-                    }
-                }
-                await delay(100)
-            }
-        } else if (type === "show") {
-            for (const item of updatedItems) {
-                const { title, ratingKey } = item;
-                logger.info(`Fetching streams for ${type} '${title}'`)
-                const showStreams = await fetchStreamsForShow(ratingKey)
-                for (const stream of showStreams) {
-                    const groupFilters = config.filters[libraryName]
-                    const newStreams = {}
-
-                    for (const group in groupFilters) {
-                        const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                        if (matchedStreams.length > 0) {
-                            newStreams[group] = matchedStreams
-                        }
-                    }
-                    await delay(100)
-                }
-            }
+        const items = (await fetchUpdatedMediaItems(id, type, 0)) || []
+        for (const item of items) {
+            await processParts([await fetchStreamsForItem(item.ratingKey)], libraryName, null)
         }
     }
 }
@@ -555,6 +577,7 @@ const performDryRun = async () => {
 
 // Partial run: process items updated since last run
 const performPartialRun = async (cleanRun) => {
+    await refreshUsers()
     await fetchAllLibraries()
 
     logger.info(`STARTING ${cleanRun ? "CLEAN" : "PARTIAL"} RUN`)
@@ -572,8 +595,12 @@ const performPartialRun = async (cleanRun) => {
         const lastUpdatedAt = lastRunTimestamps[libraryName] || 0
 
         // Fetch updated media items based on updatedAt timestamp
-        const updatedItems = await fetchUpdatedMediaItems(id, lastUpdatedAt)
-        if (!updatedItems || updatedItems.length === 0) {
+        const updatedItems = await fetchUpdatedMediaItems(id, type, lastUpdatedAt)
+        if (updatedItems === null) {
+            logger.warn(`Could not read library ${libraryName}. Leaving it for the next run`)
+            continue
+        }
+        if (updatedItems.length === 0) {
             logger.info(`No changes detected in library ${libraryName} since the last run`)
             continue
         }
@@ -584,52 +611,13 @@ const performPartialRun = async (cleanRun) => {
             continue
         }
 
-        if (type === "movie") {
-            for (const item of updatedItems) {
-                const stream = await fetchStreamsForItem(item.ratingKey)
-                const groupFilters = config.filters[libraryName]
-                const newStreams = {}
-
-                for (const group in groupFilters) {
-                    const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                    if (matchedStreams.length > 0) {
-                        newStreams[group] = matchedStreams
-                    }
-                }
-
-                if (Object.keys(newStreams).length > 0) {
-                    await updateDefaultStreamsPerItem(newStreams, config.filters[libraryName], usersWithAccess)
-                }
-
-                // Optional: Delay between processing each item to reduce load
-                await delay(100) // 100ms delay
-            }
-        } else if (type === "show") {
-            for (const item of updatedItems) {
-                const showStreams = await fetchStreamsForShow(item.ratingKey)
-                for (const stream of showStreams) {
-                    const groupFilters = config.filters[libraryName]
-                    const newStreams = {}
-
-                    for (const group in groupFilters) {
-                        const matchedStreams = await identifyStreamsToUpdate([stream], groupFilters[group])
-                        if (matchedStreams.length > 0) {
-                            newStreams[group] = matchedStreams
-                        }
-                    }
-
-                    if (Object.keys(newStreams).length > 0) {
-                        await updateDefaultStreamsPerItem(newStreams, config.filters[libraryName], usersWithAccess)
-                    }
-
-                    // Optional: Delay between processing each stream to reduce load
-                    await delay(100) // 100ms delay
-                }
-            }
+        logger.info(`${updatedItems.length} item(s) changed in library ${libraryName} since the last run`)
+        for (const item of updatedItems) {
+            await processParts([await fetchStreamsForItem(item.ratingKey)], libraryName, usersWithAccess)
         }
 
         // Update the timestamp for the current library
-        const latestUpdatedAt = Math.max(...updatedItems.map((item) => item.updatedAt))
+        const latestUpdatedAt = updatedItems.reduce((latest, item) => Math.max(latest, item.updatedAt), lastUpdatedAt)
         newTimestamps[libraryName] = latestUpdatedAt
     }
 
@@ -639,100 +627,78 @@ const performPartialRun = async (cleanRun) => {
     logger.info(`FINISHED ${cleanRun ? "CLEAN" : "PARTIAL"} RUN`)
 }
 
-// Tautulli webhook for new items
-app.post("/webhook", async (req, res) => {
-    try {
-        logger.info("Tautulli webhook received. Processing...")
+const WEBHOOK_TYPES = new Set(["movie", "show", "season", "episode"])
+// Plex ids are short decimal strings. Anything else is rejected before it can be interpolated
+// into a request path or written to the log.
+const isPlexId = (value) => (typeof value === "string" || typeof value === "number") && /^\d{1,12}$/.test(String(value))
 
-        const { type, libraryId, mediaId } = req.body
-        if (!type || !libraryId || !mediaId) throw new Error("Error getting request body")
+// Constant-time comparison. Both sides are hashed first so their lengths cannot leak either.
+const secretMatches = (provided) => {
+    const digest = (value) => crypto.createHash("sha256").update(String(value)).digest()
+    return crypto.timingSafeEqual(digest(config.webhook_secret), digest(typeof provided === "string" ? provided : ""))
+}
 
-        let libraryName = LIBRARIES.get(libraryId)?.name
+const handleWebhook = async (type, libraryId, mediaId) => {
+    logger.info(`Tautulli webhook received for ${type} ${mediaId}. Processing...`)
+    await refreshUsers()
+
+    let libraryName = LIBRARIES.get(libraryId)?.name
+    if (!libraryName) {
+        // This only triggers if something goes wrong in Tautulli/Plex. Quick refresh should fix it.
+        logger.info(`Library ID ${libraryId} not found in filters. Attempting library refresh...`)
+        await fetchAllLibraries()
+
+        libraryName = LIBRARIES.get(libraryId)?.name
         if (!libraryName) {
-            // This only triggers if something goes wrong in Tautulli/Plex. Quick refresh should fix it.
-            logger.info(`Library ID ${libraryId} not found in filters. Attempting library refresh...`)
-            await fetchAllLibraries()
-
-            libraryName = LIBRARIES.get(libraryId)?.name
-            if (!libraryName) {
-                logger.info(`Library ID ${libraryId} not found in filters. Ending request`)
-                return res.status(200).send("Event not relevant")
-            }
+            logger.info(`Library ID ${libraryId} not found in filters. Ending request`)
+            return
         }
-
-        const usersWithAccess = await fetchUsersWithAccess(libraryName)
-        const filters = config.filters[libraryName]
-
-        let streams = [] // Need arrays for identifyStreamsToUpdate
-        if (type === "movie" || type === "episode") {
-            streams = [await fetchStreamsForItem(mediaId)]
-        } else if (type === "show") {
-            streams = await fetchStreamsForShow(mediaId)
-        } else if (type === "season") {
-            streams = await fetchStreamsForSeason(mediaId)
-        }
-        // else do nothing
-
-        const updates = []
-        for (const group in filters) {
-            const newStreams = await identifyStreamsToUpdate(streams, filters[group])
-            if (!newStreams || newStreams.length === 0) {
-                logger.info("Could not find streams to update. Ending request")
-                continue
-            }
-            updates.push({ group, newStreams })
-        }
-
-        for (const { group, newStreams } of updates) {
-            let usernames = usersWithAccess.get(group)
-            if (usernames.length === 0) {
-                logger.warn(`No users found in group '${group}'. Skipping update.`)
-                continue
-            }
-
-            for (const username of usernames) {
-                const token = USERS.get(username)
-                if (!token) {
-                    logger.warn(`No access token found for user '${username}'. Skipping update.`)
-                    continue
-                }
-
-                for (const stream of newStreams) {
-                    const queryParams = new URLSearchParams()
-                    if (stream.audioStreamId) queryParams.append("audioStreamID", stream.audioStreamId)
-                    if (stream.subtitleStreamId >= 0) queryParams.append("subtitleStreamID", stream.subtitleStreamId)
-
-                    try {
-                        const response = await axiosInstance.post(
-                            `/library/parts/${stream.partId}?${queryParams.toString()}`,
-                            {},
-                            { headers: { "X-Plex-Token": token } }
-                        )
-
-                        const audioMessage = stream.audioStreamId ? `Audio ID ${stream.audioStreamId}` : ""
-                        const subtitleMessage = stream.subtitleStreamId ? `Subtitle ID ${stream.subtitleStreamId}` : ""
-                        const updateMessage = [audioMessage, subtitleMessage].filter(Boolean).join(" and ")
-                        logger.info(
-                            `Update ${updateMessage} for user ${username} in group ${group}: ${
-                                response.status === 200 ? "SUCCESS" : "FAIL"
-                            }`
-                        )
-                    } catch (error) {
-                        handleAxiosError(`posting update for user '${username}' in group '${group}'`, error)
-                    }
-
-                    // Optional: Delay between posting each update to reduce load
-                    await delay(100) // 50ms delay
-                }
-            }
-        }
-
-        logger.info("Tautulli webhook finished")
-        return res.status(200).send("Webhook received and processed.")
-    } catch (error) {
-        logger.error(`Error processing webhook: ${error.message}`)
-        res.status(500).send("Error processing webhook")
     }
+
+    const usersWithAccess = await fetchUsersWithAccess(libraryName)
+
+    let parts = []
+    if (type === "movie" || type === "episode") {
+        parts = [await fetchStreamsForItem(mediaId)]
+    } else if (type === "show") {
+        parts = await fetchStreamsForShow(mediaId)
+    } else if (type === "season") {
+        parts = await fetchStreamsForSeason(mediaId)
+    }
+    await processParts(parts, libraryName, usersWithAccess)
+
+    logger.info("Tautulli webhook finished")
+}
+
+// Webhooks are acknowledged immediately and worked through one at a time, so a burst cannot
+// fan out into unbounded concurrent Plex traffic. Past MAX_QUEUE pending, new ones are refused.
+let webhookTail = Promise.resolve()
+let webhooksPending = 0
+
+// Tautulli webhook for new items
+app.post("/webhook", (req, res) => {
+    if (config.webhook_secret && !secretMatches(req.get("X-Defaulterr-Secret"))) {
+        logger.warn("Webhook rejected: missing or incorrect X-Defaulterr-Secret header")
+        return res.status(401).send("Unauthorized")
+    }
+
+    const { type, libraryId, mediaId } = req.body || {}
+    if (!WEBHOOK_TYPES.has(type) || !isPlexId(libraryId) || !isPlexId(mediaId)) {
+        logger.warn("Webhook rejected: payload must be { type, libraryId, mediaId } with numeric ids")
+        return res.status(400).send("Invalid payload")
+    }
+
+    if (webhooksPending >= MAX_QUEUE) {
+        logger.warn(`Webhook rejected: ${webhooksPending} already pending`)
+        return res.status(503).set("Retry-After", "60").send("Busy")
+    }
+
+    webhooksPending++
+    webhookTail = webhookTail
+        .then(() => handleWebhook(type, String(libraryId), String(mediaId)))
+        .catch((error) => logger.error(`Error processing webhook: ${error.message}`))
+        .finally(() => webhooksPending--)
+    return res.status(202).send("Queued")
 })
 
 // Handle uncaught exceptions and unhandled rejections
@@ -741,13 +707,10 @@ process.on("unhandledRejection", (reason) => logger.error(`Unhandled rejection: 
 
 // Initializing the application
 const PORT = process.env.PORT || 3184
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
     logger.info(`Server is running on port ${PORT}`)
     try {
-        if (config.plex_owner_name) {
-            USERS.set(config.plex_owner_name, config.plex_owner_token)
-        }
-        await fetchAllUsersListedInFilters()
+        await refreshUsers({ force: true })
         if (USERS.size === 0) throw new Error("No users with access to libraries detected")
 
         if (config.dry_run) await performDryRun()
@@ -761,3 +724,13 @@ app.listen(PORT, async () => {
         process.exit(1)
     }
 })
+
+// node runs as PID 1 in the container, where SIGTERM has no default action. Without a handler
+// `docker stop` waits out its full timeout and then kills the process.
+const shutdown = (signal) => {
+    logger.info(`Received ${signal}. Shutting down.`)
+    server.close(() => process.exit(0))
+    setTimeout(() => process.exit(0), 2000).unref()
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"))
+process.on("SIGINT", () => shutdown("SIGINT"))
