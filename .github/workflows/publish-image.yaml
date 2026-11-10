@@ -11,13 +11,34 @@ on:
         default: ""
   push:
     branches: [main]
+  pull_request:
+  schedule:
+    # Rebuild weekly so the image picks up Node and Alpine patches even when nothing is merged
+    - cron: "17 9 * * 1"
 
 permissions:
   contents: read
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
+
   publish_image:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

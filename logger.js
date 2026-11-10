@@ -10,7 +10,11 @@ const logger = winston.createLogger({
     format: winston.format.combine(
         winston.format.timestamp({ format: "YYYY-MM-DD HH:mm:ss" }),
         winston.format.printf(({ timestamp, level, message }) => {
-            return `${timestamp} [${level.toUpperCase()}]: ${message}`
+            // Titles and other values from Plex end up in messages. Collapse control characters
+            // so nothing in them can start a new line and pass itself off as a log entry.
+            // eslint-disable-next-line no-control-regex
+            const safe = String(message).replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ")
+            return `${timestamp} [${level.toUpperCase()}]: ${safe}`
         })
     ),
     transports: [

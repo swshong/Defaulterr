@@ -230,7 +230,7 @@ const schema = {
 }
 
 const formatErrors = (errors) => {
-    return errors.map((error) => `"${error.instancePath}": ${error.message || "Validation error"}`).join("\n")
+    return errors.map((error) => `"${error.instancePath}": ${error.message || "Validation error"}`).join("; ")
 }
 
 // Checks the schema cannot express: references between sections, and values the schema
@@ -266,7 +266,7 @@ const loadAndValidateYAML = () => {
         const validate = ajv.compile(schema)
         const isValid = validate(jsonData)
 
-        if (!isValid) throw new Error(`\n${formatErrors(validate.errors)}`)
+        if (!isValid) throw new Error(formatErrors(validate.errors))
 
         const problems = semanticErrors(jsonData)
         if (problems.length > 0) throw new Error(problems.join("; "))

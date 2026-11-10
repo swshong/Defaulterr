@@ -168,6 +168,7 @@ Everything lives in `config.yaml`. A full worked example ships as
 | `plex_owner_token` | **yes** | The server owner's token. |
 | `plex_client_identifier` | **yes** | The **server's** `clientIdentifier` (see [step 2](#2-get-your-plex-credentials)). |
 | `plex_owner_name` | no | Your own Plex username. Required only if you want to include *yourself* in a group. |
+| `webhook_secret` | no | Shared secret of at least 16 characters. When set, `POST /webhook` is refused unless the request carries it in an `X-Defaulterr-Secret` header. Without it, anything that can reach port 3184 can trigger processing. |
 
 ### 2. Run modes
 
@@ -395,6 +396,12 @@ required.
    actually reach.
 5. **Webhook Method:** `POST`
 6. Under **Triggers**, enable **Recently Added**.
+   If you set `webhook_secret` (recommended, see [Server settings](#1-server-settings)), also paste this
+   into **JSON Headers** on the same tab, using your own value:
+
+   ```json
+   { "X-Defaulterr-Secret": "your-secret-of-at-least-16-characters" }
+   ```
 7. Under **Data → Recently Added**, paste this into **JSON Data**:
 
 ```json
@@ -470,6 +477,10 @@ the settings above.
 | `TZ` | UTC | Timezone for log timestamps and cron schedules. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug`. Use `debug` when tuning filters — it logs every non-match. |
 | `PORT` | `3184` | Port for the webhook and health endpoints. |
+| `DEFAULTERR_STEP_DELAY_MS` | `100` | Pause between Plex requests. Lower is faster and harder on Plex. |
+| `DEFAULTERR_RETRY_DELAY_MS` | `30000` | Base delay before retrying a failed request. |
+| `DEFAULTERR_USER_REFRESH_MS` | `900000` | How often the user list and library access checks are refreshed. |
+| `DEFAULTERR_MAX_QUEUE` | `100` | Webhooks allowed to wait in line before new ones get `503`. |
 
 ### Volumes
 

@@ -4,7 +4,6 @@ const fs = require("fs")
 const axios = require("axios")
 const logger = require("./logger")
 const cron = require("node-cron")
-const cronValidator = require("cron-validator")
 const xml2js = require("xml2js")
 const loadAndValidateYAML = require("./configBuilder")
 const { STREAM_TYPES, resolveSelection } = require("./filters")
@@ -175,7 +174,7 @@ const fetchUsersWithAccess = async (libraryName) => {
 // Setup Cron Job
 const setupCronJob = () => {
     if (config.dry_run || !config.partial_run_cron_expression) return
-    if (!cronValidator.isValidCron(config.partial_run_cron_expression))
+    if (!cron.validate(config.partial_run_cron_expression))
         throw new Error(`Invalid cron expression: ${config.partial_run_cron_expression}`)
     let running = false
     cron.schedule(config.partial_run_cron_expression, async () => {
@@ -708,7 +707,7 @@ process.on("unhandledRejection", (reason) => logger.error(`Unhandled rejection: 
 
 // Initializing the application
 const PORT = process.env.PORT || 3184
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
     logger.info(`Server is running on port ${PORT}`)
     try {
         await refreshUsers({ force: true })
@@ -725,3 +724,13 @@ app.listen(PORT, async () => {
         process.exit(1)
     }
 })
+
+// node runs as PID 1 in the container, where SIGTERM has no default action. Without a handler
+// `docker stop` waits out its full timeout and then kills the process.
+const shutdown = (signal) => {
+    logger.info(`Received ${signal}. Shutting down.`)
+    server.close(() => process.exit(0))
+    setTimeout(() => process.exit(0), 2000).unref()
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"))
+process.on("SIGINT", () => shutdown("SIGINT"))
